@@ -97,9 +97,12 @@ def init_dap(dap_size=None):
             set_missing_distributed_environ('MASTER_ADDR', "localhost")
             set_missing_distributed_environ('MASTER_PORT', 18417)
             
+            from datetime import timedelta
+            nccl_timeout = int(os.environ.get('NCCL_TIMEOUT', 7200))
             torch.distributed.init_process_group(
                 backend='nccl',
-                init_method='env://'
+                init_method='env://',
+                timeout=timedelta(seconds=nccl_timeout),  # default 2h — --no_kernels diffusion can take >45 min
             )
         
         _DAP_SIZE = torch.distributed.get_world_size()

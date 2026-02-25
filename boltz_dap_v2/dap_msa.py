@@ -45,6 +45,10 @@ class DAPMSALayer(nn.Module):
         # Wrap pairformer with DAP
         self.pairformer_layer = DAPPairformerNoSeqLayer(original_layer.pairformer_layer)
 
+        # Granular checkpoint support
+        self._save_gran_ckpts = False
+        self._gran_ckpt_data = {}
+
     def forward(
         self,
         z: Tensor,
@@ -82,28 +86,27 @@ class DAPMSALayer(nn.Module):
         _msa_mem("entry")
 
         # 1. pair_weighted_averaging with scattered z bias
+        #    Always use the DAP path (scatter/gather are no-ops when dap_size=1)
+        #    to ensure bitwise reproducibility between 1-GPU and multi-GPU runs.
         pwa = self.pair_weighted_averaging
         msa_dropout = get_dropout_mask(self.msa_dropout, m, self.training)
 
-        if dap_size > 1:
-            # Compute proj_z on scattered z → [B, N/dap, N, H]
-            # Then gather only the small bias, not full z
-            z_normed_scattered = pwa.norm_z(z)
-            b_scattered = pwa.proj_z(z_normed_scattered)  # [B, N/dap, N, H=8]
-            del z_normed_scattered
-            b_full = gather(b_scattered.contiguous(), dim=1,
-                           original_size=original_N)  # [B, N, N, 8] — tiny!
-            del b_scattered
+        # Compute proj_z on scattered z → [B, N/dap, N, H]
+        # Then gather only the small bias, not full z
+        z_normed_scattered = pwa.norm_z(z)
+        b_scattered = pwa.proj_z(z_normed_scattered)  # [B, N/dap, N, H=8]
+        del z_normed_scattered
+        b_full = gather(b_scattered.contiguous(), dim=1,
+                       original_size=original_N)  # [B, N, N, 8] — tiny!
+        del b_scattered
 
-            # Run PWA manually with pre-computed bias
-            m_normed = pwa.norm_m(m)
-            pwa_out = _pwa_with_bias(pwa, m_normed, b_full, token_mask,
-                                      chunk_heads_pwa)
-            del b_full
-            m = m + msa_dropout * pwa_out
-            del pwa_out
-        else:
-            m = m + msa_dropout * pwa(m, z, token_mask, chunk_heads_pwa)
+        # Run PWA manually with pre-computed bias
+        m_normed = pwa.norm_m(m)
+        pwa_out = _pwa_with_bias(pwa, m_normed, b_full, token_mask,
+                                  chunk_heads_pwa)
+        del b_full
+        m = m + msa_dropout * pwa_out
+        del pwa_out
 
         _msa_mem("after PWA")
 
@@ -112,19 +115,34 @@ class DAPMSALayer(nn.Module):
 
         _msa_mem("after MSA transition")
 
-        # 3. outer_product_mean with scattered output
-        opm = self.outer_product_mean
-        if dap_size > 1:
-            opm_scattered = _opm_scattered(
-                opm, m, msa_mask, chunk_size_outer_product
-            )
-        else:
-            opm_scattered = opm(m, msa_mask, chunk_size_outer_product)
+        # Granular checkpoint: m after PWA + transition (before OPM)
+        if self._save_gran_ckpts:
+            if dap_rank == 0:
+                self._gran_ckpt_data["after_pwa_and_transition_m"] = m.detach().cpu().to(torch.bfloat16)
+                # Also save z before OPM (already scattered, gather it)
+            z_full_pre = gather(z.contiguous(), dim=1, original_size=original_N) if dap_size > 1 else z
+            if dap_rank == 0:
+                self._gran_ckpt_data["before_opm_z"] = z_full_pre[:, :original_N, :original_N, :].detach().cpu().to(torch.bfloat16)
+            del z_full_pre
 
+        # 3. outer_product_mean — scattered computation (no full [B,N,N,C] on any GPU)
+        #    Always use _opm_scattered for bitwise reproducibility
+        #    (scatter/gather are no-ops when dap_size=1).
+        opm = self.outer_product_mean
+        opm_scattered = _opm_scattered(
+            opm, m, msa_mask, chunk_size_outer_product
+        )
         z = z + opm_scattered
         del opm_scattered
 
         _msa_mem("after OPM")
+
+        # Granular checkpoint: z after OPM (ALL ranks must call gather)
+        if self._save_gran_ckpts:
+            z_full = gather(z.contiguous(), dim=1, original_size=original_N)
+            if dap_rank == 0:
+                self._gran_ckpt_data["after_opm"] = z_full[:, :original_N, :original_N, :].cpu().to(torch.bfloat16)
+            del z_full
 
         # 4. Pairformer layer (DAP-aware)
         if dap_size > 1:
@@ -141,10 +159,13 @@ class DAPMSALayer(nn.Module):
         # Enable PF sub-op profiling when MSA diagnostics are active
         self.pairformer_layer._diag_enabled = _msa_diag
 
+        # Force use_kernels=False for MSA PF to match PyTorch-native DAP ops
+        _msa_use_kernels = False
+
         z = self.pairformer_layer(
             z, pair_mask_scattered,
             chunk_size_tri_attn=chunk_size_tri_attn,
-            use_kernels=use_kernels,
+            use_kernels=_msa_use_kernels,
         )
 
         if _msa_diag and dap_rank == 0:
@@ -157,6 +178,13 @@ class DAPMSALayer(nn.Module):
                   f"persistent_delta={_pf_alloc_after - _pf_alloc_before}MB", flush=True)
 
         _msa_mem("after PF layer")
+
+        # Granular checkpoint: z after PF (ALL ranks must call gather)
+        if self._save_gran_ckpts:
+            z_full = gather(z.contiguous(), dim=1, original_size=original_N)
+            if dap_rank == 0:
+                self._gran_ckpt_data["after_pf"] = z_full[:, :original_N, :original_N, :].cpu().to(torch.bfloat16)
+            del z_full
 
         return z, m
 
@@ -227,44 +255,47 @@ def _pwa_with_bias(pwa, m_normed, b_full, mask, chunk_heads):
 def _opm_scattered(opm, m, mask, chunk_size):
     """Run OuterProductMean with row-scattered output.
 
-    Instead of computing full [B, N, N, C] then scattering,
-    scatter a on position dim, keep b full, so einsum produces
-    [B, N/dap, N, c_hidden*c_hidden] directly.
+    Scatter `a` on position dim, keep `b` full, so einsum produces
+    [B, N/dap, N, c_hidden*c_hidden] directly — no full [B, N, N, C]
+    tensor is ever allocated.
 
-    m: [B, S, N, c_in] — replicated
-    mask: [B, S] — MSA mask
+    m:    [B, S, N, c_in]  — replicated on all ranks
+    mask: [B, S, N]        — MSA mask (per-sequence, per-position)
     Returns: [B, N/dap, N, c_out] — row-scattered
     """
-    # Expand mask: [B, S] → [B, S, N, 1]
+    # Expand mask: [B, S, N] → [B, S, N, 1]
     mask_exp = mask.unsqueeze(-1).to(m)
 
-    # Compute projections on full m — m is replicated
+    # Compute projections on full m (replicated)
     m_normed = opm.norm(m)
-    a = opm.proj_a(m_normed) * mask_exp  # [B, S, N, c_hidden=32]
-    b = opm.proj_b(m_normed) * mask_exp  # [B, S, N, c_hidden=32]
+    a = opm.proj_a(m_normed) * mask_exp  # [B, S, N, c_hidden]
+    b = opm.proj_b(m_normed) * mask_exp  # [B, S, N, c_hidden]
+    del m_normed
 
-    # Scatter a on position dim (dim=2): [B, S, N, c_h] → [B, S, N/dap, c_h]
-    a_scattered = scatter(a, dim=2)
+    # Scatter a AND mask on position dim (dim=2, the N dimension)
+    # This gives each GPU its local rows of a and the corresponding mask
+    a_scattered = scatter(a, dim=2)      # [B, S, N/dap, c_hidden]
+    mask_a = scatter(mask_exp, dim=2)    # [B, S, N/dap, 1]
     del a
+    # b and mask_b stay full (all j-columns needed)
+    mask_b = mask_exp                    # [B, S, N, 1]
 
     if chunk_size is not None and not opm.training:
-        # Compute pairwise mask in chunks for scattered output
-        # Need num_mask [B, N/dap, N, 1]
-        mask_scattered = scatter(mask_exp, dim=2)  # [B, S, N/dap, 1]
-        for i in range(0, mask_exp.shape[1], 64):
-            # mask_scattered[:, chunk, :, :] is [B, chunk, N/dap, 1]
-            # mask_exp[:, chunk, :, :] is [B, chunk, N, 1]
-            ms = mask_scattered[:, i:i+64]        # [B, chunk, N/dap, 1]
-            mf = mask_exp[:, i:i+64]              # [B, chunk, N, 1]
-            # Cross: [B, chunk, N/dap, 1] * [B, chunk, 1, N] → [B, chunk, N/dap, N]
-            cross = ms * mf.squeeze(-1).unsqueeze(2)
+        # Compute num_mask_scattered from mask_a × mask_b
+        # num_mask[b, i_local, j] = sum_s(mask[b,s,i_local] * mask[b,s,j])
+        for i in range(0, mask_a.shape[1], 64):
+            chunk_ma = mask_a[:, i : i + 64, :, :]   # [B, 64, N/dap, 1]
+            chunk_mb = mask_b[:, i : i + 64, :, :]   # [B, 64, N, 1]
+            cross = chunk_ma[:, :, :, None, :] * chunk_mb[:, :, None, :, :]
+            # cross: [B, 64, N/dap, N, 1]
             if i == 0:
-                num_mask = cross.sum(1)  # [B, N/dap, N]
+                num_mask = cross.sum(1)              # [B, N/dap, N, 1]
             else:
-                num_mask = num_mask + cross.sum(1)
-        num_mask = num_mask.unsqueeze(-1).clamp(min=1)  # [B, N/dap, N, 1]
+                num_mask += cross.sum(1)
+            del cross
+        num_mask = num_mask.clamp(min=1)
 
-        # Compute in chunks over c_hidden
+        # Compute in chunks over c_hidden (same as original OPM)
         for i in range(0, opm.c_hidden, chunk_size):
             a_chunk = a_scattered[:, :, :, i:i+chunk_size]
             sliced_weight = opm.proj_o.weight[
@@ -281,16 +312,16 @@ def _opm_scattered(opm, m, mask, chunk_size):
         z_out = z_out + opm.proj_o.bias
         return z_out
     else:
-        # Non-chunked path
-        # num_mask: for each scattered row i and full col j,
-        # count MSA sequences where both positions are valid
-        mask_scattered = scatter(mask_exp, dim=2)  # [B, S, N/dap, 1]
-        # [B, S, N/dap, 1] * [B, S, 1, N] → [B, S, N/dap, N]
-        mask_ij = mask_scattered * mask_exp.squeeze(-1).unsqueeze(2)
-        num_mask = mask_ij.sum(1).unsqueeze(-1).clamp(min=1)  # [B, N/dap, N, 1]
+        # Non-chunked path — use float32 like original
+        # num_mask from mask_a_scattered × mask_b_full
+        cross = mask_a[:, :, :, None, :] * mask_b[:, :, None, :, :]
+        # cross: [B, S, N/dap, N, 1]
+        num_mask = cross.sum(1).clamp(min=1)  # [B, N/dap, N, 1]
+        del cross
 
         z = torch.einsum("bsic,bsjd->bijcd", a_scattered.float(), b.float())
         z = z.reshape(*z.shape[:3], -1)
         z = z / num_mask
         z = opm.proj_o(z.to(m))
         return z
+

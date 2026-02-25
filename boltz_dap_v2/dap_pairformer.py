@@ -13,6 +13,7 @@ Flow per layer (row-scattered z [B, N/dap, N, D]):
 import torch
 from torch import Tensor, nn
 from typing import Optional
+import pathlib
 
 import sys
 import os
@@ -58,6 +59,7 @@ class DAPPairformerLayer(nn.Module):
         use_kernels: bool = False,
         use_cuequiv_mul: bool = False,
         use_cuequiv_attn: bool = False,
+        layer_idx: int = -1,
     ) -> tuple[Tensor, Tensor]:
         """Forward.
 
@@ -70,6 +72,26 @@ class DAPPairformerLayer(nn.Module):
         dap_rank = get_dap_rank()
         original_N = z.shape[2]
 
+        # Sub-op checkpointing: only for layer 0
+        # NOTE: gather() is NCCL collective — ALL ranks must call it!
+        _subop_dir = os.environ.get("BOLTZ_SAVE_SUBOP_CKPT", "")
+        _do_subop = bool(_subop_dir) and layer_idx == 0
+        if layer_idx == 0 and dap_rank == 0:
+            print(f"[SUBOP-DEBUG] layer_idx={layer_idx} _subop_dir='{_subop_dir}' _do_subop={_do_subop}", flush=True)
+        if _do_subop and dap_rank == 0:
+            _subop_path = pathlib.Path(_subop_dir)
+            _subop_path.mkdir(parents=True, exist_ok=True)
+
+        def _save_z(name):
+            """Gather scattered z (collective!) and save on rank 0."""
+            if not _do_subop:
+                return
+            # ALL ranks must call gather (NCCL collective)
+            z_full = gather(z.contiguous(), dim=1, original_size=original_N)
+            if dap_rank == 0:
+                torch.save(z_full.detach().cpu(), pathlib.Path(_subop_dir) / f"{name}.pt")
+            del z_full
+
         def _mem(label):
             pass  # Disabled: use [TIMELINE] logs in dap_trunk.py instead
 
@@ -81,6 +103,7 @@ class DAPPairformerLayer(nn.Module):
         dropout = get_dropout_mask(self.dropout, z, self.training)
         z = z + dropout * self.tri_mul_out(z, mask=pair_mask, use_kernels=use_kernels)
         _mem("after tri_mul_out")
+        _save_z("after_trimul_out")
 
         # 2. TriMulIn (col-scattered round-trip)
         z_col = row_to_col(z)
@@ -92,6 +115,7 @@ class DAPPairformerLayer(nn.Module):
         if z.shape[2] > original_N:
             z = z[:, :, :original_N, :]
         _mem("after tri_mul_in")
+        _save_z("after_trimul_in")
 
         # 3. TriAttStart (scattered, gathers only bias)
         dropout = get_dropout_mask(self.dropout, z, self.training)
@@ -99,6 +123,7 @@ class DAPPairformerLayer(nn.Module):
             z, mask=pair_mask, chunk_size=chunk_size_tri_attn, use_kernels=use_kernels,
         )
         _mem("after tri_att_start")
+        _save_z("after_triatt_start")
 
         # 4. TriAttEnd (internally handles row_to_col)
         dropout = get_dropout_mask(self.dropout, z, self.training, columnwise=True)
@@ -106,9 +131,10 @@ class DAPPairformerLayer(nn.Module):
             z, mask=pair_mask, chunk_size=chunk_size_tri_attn, use_kernels=use_kernels,
         )
         _mem("after tri_att_end")
+        _save_z("after_triatt_end")
 
         # 5. Transition (pointwise, chunked to avoid 4×D expansion spike)
-        z = z + self.transition_z(z, chunk_size=128)
+        z = z + self.transition_z(z)
         _mem("after transition_z")
 
         # === Sequence attention (gather only bias, not full z) ===
@@ -150,6 +176,10 @@ class DAPPairformerLayer(nn.Module):
 
         _mem("after seq_attn")
         self._logged = True
+
+        if _do_subop:
+            # Clear env var so only first recycling step saves
+            os.environ.pop("BOLTZ_SAVE_SUBOP_CKPT", None)
 
         # z stays scattered
         return s, z

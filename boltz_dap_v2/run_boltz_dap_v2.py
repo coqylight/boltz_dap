@@ -104,6 +104,8 @@ class GPUMonitor:
 @click.option("--sampling_steps", type=int, default=200)
 @click.option("--diffusion_samples", type=int, default=1)
 @click.option("--use_msa_server", is_flag=True)
+@click.option("--no_kernels", is_flag=True, help="Disable cuequivariance CUDA kernels (use PyTorch-native ops)")
+@click.option("--seed", type=int, default=None, help="Random seed for deterministic runs")
 def main(
     data: str,
     out_dir: str,
@@ -112,6 +114,8 @@ def main(
     sampling_steps: int = 200,
     diffusion_samples: int = 1,
     use_msa_server: bool = False,
+    no_kernels: bool = False,
+    seed: int = None,
 ):
     """Run Boltz 2 with proper FastFold-style DAP (no model duplication)."""
 
@@ -125,11 +129,28 @@ def main(
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     device = torch.device(f'cuda:{local_rank}')
 
+    # Deterministic seeding for controlled A/B testing
+    if seed is not None:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        import numpy as np
+        np.random.seed(seed)
+        # Force deterministic cuBLAS GEMMs (same results across GPUs with same inputs)
+        # NOTE: do NOT use torch.use_deterministic_algorithms(True) — it disables
+        # Flash Attention and causes OOM on long sequences.
+        os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        if dap_rank == 0:
+            print(f"  [SEED] Set torch/numpy seed={seed} + deterministic cuBLAS/cuDNN")
+
     # Paths
     data = Path(data)
     out_dir = Path(out_dir)
     cache = Path(cache).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
+    import os as _os
+    _os.environ['BOLTZ_OUT_DIR'] = str(out_dir)
     log_file = out_dir / "gpu_memory.log"
 
     def rank_print(msg):
@@ -239,7 +260,7 @@ def main(
         map_location="cpu",
         diffusion_process_args=asdict(diffusion_params),
         ema=False,
-        use_kernels=False,
+        use_kernels=not no_kernels,
         pairformer_args=asdict(pairformer_args),
         msa_args=asdict(msa_args),
         steering_args=asdict(steering_args),
@@ -387,6 +408,15 @@ def main(
                 batch_idx=batch_idx,
                 dataloader_idx=0,
             )
+
+            # Save z and s tensors for comparison
+            if pred_dict.get("s") is not None and pred_dict.get("z") is not None:
+                zs_path = out_dir / "zs_tensors.pt"
+                torch.save({
+                    "s": pred_dict["s"].cpu(),
+                    "z": pred_dict["z"].cpu(),
+                }, str(zs_path))
+                rank_print(f"  ✓ Saved z/s tensors to {zs_path}")
 
     # Stop monitoring
     if monitor:
