@@ -1,0 +1,1148 @@
+[
+  {
+    "step": "start",
+    "alloc_mb": 1934,
+    "peak_mb": 1934,
+    "elapsed_s": 0.0
+  },
+  {
+    "step": "after input_embedder + s_init",
+    "alloc_mb": 1967,
+    "peak_mb": 1983,
+    "elapsed_s": 0.29
+  },
+  {
+    "step": "after z_init outer product (scattered)",
+    "alloc_mb": 1967,
+    "peak_mb": 1983,
+    "elapsed_s": 0.29
+  },
+  {
+    "step": "after rel_pos_enc (scattered, full\u2192CPU)",
+    "alloc_mb": 1967,
+    "peak_mb": 1983,
+    "elapsed_s": 0.33
+  },
+  {
+    "step": "after token_bonds (scattered)",
+    "alloc_mb": 1967,
+    "peak_mb": 1983,
+    "elapsed_s": 0.33
+  },
+  {
+    "step": "after contact_conditioning (scattered, all z_init done)",
+    "alloc_mb": 1967,
+    "peak_mb": 1983,
+    "elapsed_s": 0.35
+  },
+  {
+    "step": "  template: loaded per-residue features",
+    "alloc_mb": 1967,
+    "peak_mb": 1983,
+    "elapsed_s": 0.37
+  },
+  {
+    "step": "  template: scattered row-dim coords",
+    "alloc_mb": 1967,
+    "peak_mb": 1983,
+    "elapsed_s": 0.37
+  },
+  {
+    "step": "  template: computed pairwise masks (scattered)",
+    "alloc_mb": 1968,
+    "peak_mb": 1983,
+    "elapsed_s": 0.37
+  },
+  {
+    "step": "  template: distogram computed (scattered)",
+    "alloc_mb": 1968,
+    "peak_mb": 1983,
+    "elapsed_s": 0.37
+  },
+  {
+    "step": "  template: unit_vector computed (scattered)",
+    "alloc_mb": 1968,
+    "peak_mb": 1983,
+    "elapsed_s": 0.4
+  },
+  {
+    "step": "  template: a_tij computed (scattered, no full N\u00d7N)",
+    "alloc_mb": 1968,
+    "peak_mb": 1983,
+    "elapsed_s": 0.4
+  },
+  {
+    "step": "  template: z_proj computed",
+    "alloc_mb": 1968,
+    "peak_mb": 1983,
+    "elapsed_s": 0.4
+  },
+  {
+    "step": "  template: v = z_proj + a_tij",
+    "alloc_mb": 1968,
+    "peak_mb": 1983,
+    "elapsed_s": 0.4
+  },
+  {
+    "step": "  template: v scattered, entering PF",
+    "alloc_mb": 1968,
+    "peak_mb": 1983,
+    "elapsed_s": 0.4
+  },
+  {
+    "step": "  template: PF[0] after tri_mul_out",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 0.41
+  },
+  {
+    "step": "  template: PF[0] after tri_mul_in",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 0.55
+  },
+  {
+    "step": "  template: PF[0] after tri_att_start",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 0.56
+  },
+  {
+    "step": "  template: PF[0] after tri_att_end",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 0.56
+  },
+  {
+    "step": "  template: PF[0] after transition",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 0.56
+  },
+  {
+    "step": "  template: PF layer[0] done",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 0.56
+  },
+  {
+    "step": "  template: PF[1] after tri_mul_out",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 0.56
+  },
+  {
+    "step": "  template: PF[1] after tri_mul_in",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 0.56
+  },
+  {
+    "step": "  template: PF[1] after tri_att_start",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 0.56
+  },
+  {
+    "step": "  template: PF[1] after tri_att_end",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 0.56
+  },
+  {
+    "step": "  template: PF[1] after transition",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 0.56
+  },
+  {
+    "step": "  template: PF layer[1] done",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 0.57
+  },
+  {
+    "step": "  template: PF residual added",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 0.57
+  },
+  {
+    "step": "  template: aggregated over templates",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 0.57
+  },
+  {
+    "step": "  template: u_proj computed",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 0.57
+  },
+  {
+    "step": "  template: added to z_scattered",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 0.57
+  },
+  {
+    "step": "after template_module",
+    "alloc_mb": 1967,
+    "peak_mb": 1968,
+    "elapsed_s": 0.57
+  },
+  {
+    "step": "  msa_module.layer[0]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 0.58
+  },
+  {
+    "step": "  msa_module.layer[1]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 0.59
+  },
+  {
+    "step": "  msa_module.layer[2]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 0.6
+  },
+  {
+    "step": "  msa_module.layer[3]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 0.6
+  },
+  {
+    "step": "after msa_module",
+    "alloc_mb": 1967,
+    "peak_mb": 1969,
+    "elapsed_s": 0.6
+  },
+  {
+    "step": "  pairformer.layer[0]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 1.55
+  },
+  {
+    "step": "  pairformer.layer[8]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 1.6
+  },
+  {
+    "step": "  pairformer.layer[16]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 1.65
+  },
+  {
+    "step": "  pairformer.layer[24]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 1.7
+  },
+  {
+    "step": "  pairformer.layer[32]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 1.75
+  },
+  {
+    "step": "  pairformer.layer[40]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 1.8
+  },
+  {
+    "step": "  pairformer.layer[48]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 1.86
+  },
+  {
+    "step": "  pairformer.layer[56]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 1.9
+  },
+  {
+    "step": "  pairformer.layer[63]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 1.95
+  },
+  {
+    "step": "after pairformer_module",
+    "alloc_mb": 1967,
+    "peak_mb": 1969,
+    "elapsed_s": 1.95
+  },
+  {
+    "step": "  template: loaded per-residue features",
+    "alloc_mb": 1967,
+    "peak_mb": 1969,
+    "elapsed_s": 1.98
+  },
+  {
+    "step": "  template: scattered row-dim coords",
+    "alloc_mb": 1967,
+    "peak_mb": 1969,
+    "elapsed_s": 1.98
+  },
+  {
+    "step": "  template: computed pairwise masks (scattered)",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 1.98
+  },
+  {
+    "step": "  template: distogram computed (scattered)",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 1.98
+  },
+  {
+    "step": "  template: unit_vector computed (scattered)",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 1.98
+  },
+  {
+    "step": "  template: a_tij computed (scattered, no full N\u00d7N)",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 1.98
+  },
+  {
+    "step": "  template: z_proj computed",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 1.98
+  },
+  {
+    "step": "  template: v = z_proj + a_tij",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 1.98
+  },
+  {
+    "step": "  template: v scattered, entering PF",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 1.98
+  },
+  {
+    "step": "  template: PF[0] after tri_mul_out",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 1.98
+  },
+  {
+    "step": "  template: PF[0] after tri_mul_in",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 1.99
+  },
+  {
+    "step": "  template: PF[0] after tri_att_start",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 1.99
+  },
+  {
+    "step": "  template: PF[0] after tri_att_end",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 1.99
+  },
+  {
+    "step": "  template: PF[0] after transition",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 1.99
+  },
+  {
+    "step": "  template: PF layer[0] done",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 1.99
+  },
+  {
+    "step": "  template: PF[1] after tri_mul_out",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 1.99
+  },
+  {
+    "step": "  template: PF[1] after tri_mul_in",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 1.99
+  },
+  {
+    "step": "  template: PF[1] after tri_att_start",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.0
+  },
+  {
+    "step": "  template: PF[1] after tri_att_end",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.0
+  },
+  {
+    "step": "  template: PF[1] after transition",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.0
+  },
+  {
+    "step": "  template: PF layer[1] done",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.0
+  },
+  {
+    "step": "  template: PF residual added",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.0
+  },
+  {
+    "step": "  template: aggregated over templates",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.0
+  },
+  {
+    "step": "  template: u_proj computed",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.0
+  },
+  {
+    "step": "  template: added to z_scattered",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.0
+  },
+  {
+    "step": "after template_module",
+    "alloc_mb": 1967,
+    "peak_mb": 1968,
+    "elapsed_s": 2.0
+  },
+  {
+    "step": "  msa_module.layer[0]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.01
+  },
+  {
+    "step": "  msa_module.layer[1]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.01
+  },
+  {
+    "step": "  msa_module.layer[2]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.02
+  },
+  {
+    "step": "  msa_module.layer[3]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.03
+  },
+  {
+    "step": "after msa_module",
+    "alloc_mb": 1967,
+    "peak_mb": 1969,
+    "elapsed_s": 2.03
+  },
+  {
+    "step": "  pairformer.layer[0]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.04
+  },
+  {
+    "step": "  pairformer.layer[8]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.09
+  },
+  {
+    "step": "  pairformer.layer[16]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.14
+  },
+  {
+    "step": "  pairformer.layer[24]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.19
+  },
+  {
+    "step": "  pairformer.layer[32]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.24
+  },
+  {
+    "step": "  pairformer.layer[40]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.29
+  },
+  {
+    "step": "  pairformer.layer[48]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.34
+  },
+  {
+    "step": "  pairformer.layer[56]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.39
+  },
+  {
+    "step": "  pairformer.layer[63]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.43
+  },
+  {
+    "step": "after pairformer_module",
+    "alloc_mb": 1967,
+    "peak_mb": 1969,
+    "elapsed_s": 2.43
+  },
+  {
+    "step": "  template: loaded per-residue features",
+    "alloc_mb": 1967,
+    "peak_mb": 1969,
+    "elapsed_s": 2.43
+  },
+  {
+    "step": "  template: scattered row-dim coords",
+    "alloc_mb": 1967,
+    "peak_mb": 1969,
+    "elapsed_s": 2.43
+  },
+  {
+    "step": "  template: computed pairwise masks (scattered)",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.43
+  },
+  {
+    "step": "  template: distogram computed (scattered)",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.43
+  },
+  {
+    "step": "  template: unit_vector computed (scattered)",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.44
+  },
+  {
+    "step": "  template: a_tij computed (scattered, no full N\u00d7N)",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.44
+  },
+  {
+    "step": "  template: z_proj computed",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.44
+  },
+  {
+    "step": "  template: v = z_proj + a_tij",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.44
+  },
+  {
+    "step": "  template: v scattered, entering PF",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.44
+  },
+  {
+    "step": "  template: PF[0] after tri_mul_out",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.44
+  },
+  {
+    "step": "  template: PF[0] after tri_mul_in",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.44
+  },
+  {
+    "step": "  template: PF[0] after tri_att_start",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.44
+  },
+  {
+    "step": "  template: PF[0] after tri_att_end",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.44
+  },
+  {
+    "step": "  template: PF[0] after transition",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.44
+  },
+  {
+    "step": "  template: PF layer[0] done",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.44
+  },
+  {
+    "step": "  template: PF[1] after tri_mul_out",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.44
+  },
+  {
+    "step": "  template: PF[1] after tri_mul_in",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.45
+  },
+  {
+    "step": "  template: PF[1] after tri_att_start",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.45
+  },
+  {
+    "step": "  template: PF[1] after tri_att_end",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.45
+  },
+  {
+    "step": "  template: PF[1] after transition",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.45
+  },
+  {
+    "step": "  template: PF layer[1] done",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.45
+  },
+  {
+    "step": "  template: PF residual added",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.45
+  },
+  {
+    "step": "  template: aggregated over templates",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.45
+  },
+  {
+    "step": "  template: u_proj computed",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.45
+  },
+  {
+    "step": "  template: added to z_scattered",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.45
+  },
+  {
+    "step": "after template_module",
+    "alloc_mb": 1967,
+    "peak_mb": 1968,
+    "elapsed_s": 2.45
+  },
+  {
+    "step": "  msa_module.layer[0]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.46
+  },
+  {
+    "step": "  msa_module.layer[1]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.46
+  },
+  {
+    "step": "  msa_module.layer[2]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.47
+  },
+  {
+    "step": "  msa_module.layer[3]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.48
+  },
+  {
+    "step": "after msa_module",
+    "alloc_mb": 1967,
+    "peak_mb": 1969,
+    "elapsed_s": 2.48
+  },
+  {
+    "step": "  pairformer.layer[0]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.48
+  },
+  {
+    "step": "  pairformer.layer[8]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.53
+  },
+  {
+    "step": "  pairformer.layer[16]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.59
+  },
+  {
+    "step": "  pairformer.layer[24]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.64
+  },
+  {
+    "step": "  pairformer.layer[32]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.69
+  },
+  {
+    "step": "  pairformer.layer[40]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.75
+  },
+  {
+    "step": "  pairformer.layer[48]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.79
+  },
+  {
+    "step": "  pairformer.layer[56]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.84
+  },
+  {
+    "step": "  pairformer.layer[63]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.89
+  },
+  {
+    "step": "after pairformer_module",
+    "alloc_mb": 1967,
+    "peak_mb": 1969,
+    "elapsed_s": 2.89
+  },
+  {
+    "step": "  template: loaded per-residue features",
+    "alloc_mb": 1967,
+    "peak_mb": 1969,
+    "elapsed_s": 2.89
+  },
+  {
+    "step": "  template: scattered row-dim coords",
+    "alloc_mb": 1967,
+    "peak_mb": 1969,
+    "elapsed_s": 2.89
+  },
+  {
+    "step": "  template: computed pairwise masks (scattered)",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.89
+  },
+  {
+    "step": "  template: distogram computed (scattered)",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.89
+  },
+  {
+    "step": "  template: unit_vector computed (scattered)",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.89
+  },
+  {
+    "step": "  template: a_tij computed (scattered, no full N\u00d7N)",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.89
+  },
+  {
+    "step": "  template: z_proj computed",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.89
+  },
+  {
+    "step": "  template: v = z_proj + a_tij",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.89
+  },
+  {
+    "step": "  template: v scattered, entering PF",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.89
+  },
+  {
+    "step": "  template: PF[0] after tri_mul_out",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.89
+  },
+  {
+    "step": "  template: PF[0] after tri_mul_in",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.9
+  },
+  {
+    "step": "  template: PF[0] after tri_att_start",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.9
+  },
+  {
+    "step": "  template: PF[0] after tri_att_end",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.9
+  },
+  {
+    "step": "  template: PF[0] after transition",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.9
+  },
+  {
+    "step": "  template: PF layer[0] done",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.9
+  },
+  {
+    "step": "  template: PF[1] after tri_mul_out",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.9
+  },
+  {
+    "step": "  template: PF[1] after tri_mul_in",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.9
+  },
+  {
+    "step": "  template: PF[1] after tri_att_start",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.9
+  },
+  {
+    "step": "  template: PF[1] after tri_att_end",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.91
+  },
+  {
+    "step": "  template: PF[1] after transition",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.91
+  },
+  {
+    "step": "  template: PF layer[1] done",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.91
+  },
+  {
+    "step": "  template: PF residual added",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.91
+  },
+  {
+    "step": "  template: aggregated over templates",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.91
+  },
+  {
+    "step": "  template: u_proj computed",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.91
+  },
+  {
+    "step": "  template: added to z_scattered",
+    "alloc_mb": 1968,
+    "peak_mb": 1968,
+    "elapsed_s": 2.91
+  },
+  {
+    "step": "after template_module",
+    "alloc_mb": 1967,
+    "peak_mb": 1968,
+    "elapsed_s": 2.91
+  },
+  {
+    "step": "  msa_module.layer[0]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.92
+  },
+  {
+    "step": "  msa_module.layer[1]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.92
+  },
+  {
+    "step": "  msa_module.layer[2]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.93
+  },
+  {
+    "step": "  msa_module.layer[3]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.94
+  },
+  {
+    "step": "after msa_module",
+    "alloc_mb": 1967,
+    "peak_mb": 1969,
+    "elapsed_s": 2.94
+  },
+  {
+    "step": "  pairformer.layer[0]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.94
+  },
+  {
+    "step": "  pairformer.layer[8]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 2.99
+  },
+  {
+    "step": "  pairformer.layer[16]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 3.04
+  },
+  {
+    "step": "  pairformer.layer[24]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 3.09
+  },
+  {
+    "step": "  pairformer.layer[32]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 3.14
+  },
+  {
+    "step": "  pairformer.layer[40]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 3.2
+  },
+  {
+    "step": "  pairformer.layer[48]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 3.25
+  },
+  {
+    "step": "  pairformer.layer[56]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 3.3
+  },
+  {
+    "step": "  pairformer.layer[63]",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 3.35
+  },
+  {
+    "step": "after pairformer_module",
+    "alloc_mb": 1967,
+    "peak_mb": 1969,
+    "elapsed_s": 3.35
+  },
+  {
+    "step": "after gather z (full z restored)",
+    "alloc_mb": 1968,
+    "peak_mb": 1969,
+    "elapsed_s": 3.35
+  },
+  {
+    "step": "after trunk offload to CPU",
+    "alloc_mb": 1198,
+    "peak_mb": 1969,
+    "elapsed_s": 3.97
+  },
+  {
+    "step": "after distogram (offloaded)",
+    "alloc_mb": 1198,
+    "peak_mb": 1969,
+    "elapsed_s": 3.97
+  },
+  {
+    "step": "before diffusion_conditioning (inlined)",
+    "alloc_mb": 1198,
+    "peak_mb": 1969,
+    "elapsed_s": 3.97
+  },
+  {
+    "step": "  dc: before pairwise_conditioner",
+    "alloc_mb": 1198,
+    "peak_mb": 1969,
+    "elapsed_s": 3.97
+  },
+  {
+    "step": "  dc: after pairwise proj (rel_pos_enc freed)",
+    "alloc_mb": 1199,
+    "peak_mb": 1969,
+    "elapsed_s": 3.97
+  },
+  {
+    "step": "  dc: after pairwise transition[0]",
+    "alloc_mb": 1199,
+    "peak_mb": 1969,
+    "elapsed_s": 3.97
+  },
+  {
+    "step": "  dc: after pairwise transition[1]",
+    "alloc_mb": 1199,
+    "peak_mb": 1969,
+    "elapsed_s": 3.97
+  },
+  {
+    "step": "  dc: before atom_encoder",
+    "alloc_mb": 1199,
+    "peak_mb": 1969,
+    "elapsed_s": 3.97
+  },
+  {
+    "step": "  dc: after atom_encoder",
+    "alloc_mb": 1202,
+    "peak_mb": 1969,
+    "elapsed_s": 3.98
+  },
+  {
+    "step": "  dc: after atom biases (p freed)",
+    "alloc_mb": 1205,
+    "peak_mb": 1969,
+    "elapsed_s": 3.98
+  },
+  {
+    "step": "  dc: after token_trans_bias",
+    "alloc_mb": 1205,
+    "peak_mb": 1969,
+    "elapsed_s": 3.98
+  },
+  {
+    "step": "  dc: z_cond freed",
+    "alloc_mb": 1205,
+    "peak_mb": 1969,
+    "elapsed_s": 3.98
+  },
+  {
+    "step": "after diffusion_conditioning (offloaded)",
+    "alloc_mb": 1204,
+    "peak_mb": 1969,
+    "elapsed_s": 3.98
+  },
+  {
+    "step": "  mem_opt: z offloaded to CPU",
+    "alloc_mb": 1203,
+    "peak_mb": 1969,
+    "elapsed_s": 3.98
+  },
+  {
+    "step": "  mem_opt: token_trans_bias offloaded to CPU",
+    "alloc_mb": 1203,
+    "peak_mb": 1969,
+    "elapsed_s": 3.98
+  },
+  {
+    "step": "before structure_module.sample",
+    "alloc_mb": 1203,
+    "peak_mb": 1969,
+    "elapsed_s": 3.98
+  },
+  {
+    "step": "after structure_module.sample",
+    "alloc_mb": 1203,
+    "peak_mb": 1969,
+    "elapsed_s": 8.64
+  },
+  {
+    "step": "after structure_module (offloaded, z restored)",
+    "alloc_mb": 136,
+    "peak_mb": 1969,
+    "elapsed_s": 9.37
+  },
+  {
+    "step": "before confidence (dict_out offloaded)",
+    "alloc_mb": 136,
+    "peak_mb": 1969,
+    "elapsed_s": 9.37
+  },
+  {
+    "step": "after confidence_module",
+    "alloc_mb": 136,
+    "peak_mb": 138,
+    "elapsed_s": 9.57
+  }
+]

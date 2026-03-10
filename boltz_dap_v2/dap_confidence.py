@@ -115,16 +115,28 @@ def run_confidence_dap(
     dap_rank = get_dap_rank()
     conf = model.confidence_module
 
+    # Extract z from z_holder early (before multiplicity branch)
+    # NOTE: on non-primary ranks, z may be None (only rank 0 holds full z).
+    # The scatter phase inside each recursive call distributes z from rank 0.
+    z = z_holder[0] if isinstance(z_holder, list) else z_holder
+
     # Handle sequential processing of multiple samples
     if run_sequentially and multiplicity > 1:
-        assert z.shape[0] == 1, "Not supported with batch size > 1"
+        # Only rank 0 has z; assert batch=1 only there
+        if dap_rank == 0:
+            assert z.shape[0] == 1, "Not supported with batch size > 1"
         out_dicts = []
         for sample_idx in range(multiplicity):
+            # Rank 0: slice x_pred for this sample; others: pass empty tensor
+            if dap_rank == 0:
+                x_pred_i = x_pred[sample_idx : sample_idx + 1]
+            else:
+                x_pred_i = x_pred  # empty tensor on non-primary ranks
             out_dicts.append(
                 run_confidence_dap(
                     model,
-                    s_inputs, s, z,
-                    x_pred[sample_idx : sample_idx + 1],
+                    s_inputs, s, z,  # pass z directly (not list) to avoid clearing
+                    x_pred_i,
                     feats,
                     pred_distogram_logits,
                     multiplicity=1,
@@ -132,36 +144,40 @@ def run_confidence_dap(
                     use_kernels=use_kernels,
                 )
             )
-        # Merge outputs
-        out_dict = {}
-        for key in out_dicts[0]:
-            if key != "pair_chains_iptm":
-                out_dict[key] = torch.cat([out[key] for out in out_dicts], dim=0)
-            else:
-                pair_chains_iptm = {}
-                for chain_idx1 in out_dicts[0][key]:
-                    chains_iptm = {}
-                    for chain_idx2 in out_dicts[0][key][chain_idx1]:
-                        chains_iptm[chain_idx2] = torch.cat(
-                            [out[key][chain_idx1][chain_idx2] for out in out_dicts],
-                            dim=0,
-                        )
-                    pair_chains_iptm[chain_idx1] = chains_iptm
-                out_dict[key] = pair_chains_iptm
-        return out_dict
+        # Merge outputs (only rank 0 has meaningful outputs)
+        if dap_rank == 0:
+            out_dict = {}
+            for key in out_dicts[0]:
+                if key != "pair_chains_iptm":
+                    out_dict[key] = torch.cat([out[key] for out in out_dicts], dim=0)
+                else:
+                    pair_chains_iptm = {}
+                    for chain_idx1 in out_dicts[0][key]:
+                        chains_iptm = {}
+                        for chain_idx2 in out_dicts[0][key][chain_idx1]:
+                            chains_iptm[chain_idx2] = torch.cat(
+                                [out[key][chain_idx1][chain_idx2] for out in out_dicts],
+                                dim=0,
+                            )
+                        pair_chains_iptm[chain_idx1] = chains_iptm
+                    out_dict[key] = pair_chains_iptm
+            return out_dict
+        else:
+            # Non-primary ranks return last result (not used by caller)
+            return out_dicts[-1] if out_dicts else {}
 
     # ── Memory logging helper ──────────────────────────────────────────
     import time as _time
     _conf_t0 = _time.time()
     def _cmem(label):
-        if dap_rank != 0:
-            return
         torch.cuda.synchronize()
-        alloc = torch.cuda.memory_allocated(0) // (1024 * 1024)
-        peak = torch.cuda.max_memory_allocated(0) // (1024 * 1024)
+        dev = dap_rank
+        alloc = torch.cuda.memory_allocated(dev) // (1024 * 1024)
+        resv = torch.cuda.memory_reserved(dev) // (1024 * 1024)
+        free_cuda, total_cuda = torch.cuda.mem_get_info(dev)
+        free_mb = free_cuda // (1024 * 1024)
         elapsed = _time.time() - _conf_t0
-        marker = ""
-        print(f"    [CONF]  {elapsed:6.1f}s | alloc= {alloc:5d}MB | peak= {peak:5d}MB | {label}{marker}", flush=True)
+        print(f"    [CONF R{dap_rank}]  {elapsed:6.1f}s | alloc={alloc:6d}MB | resv={resv:6d}MB | free={free_mb:6d}MB | {label}", flush=True)
 
     _cmem("conf entry")
 
@@ -169,9 +185,7 @@ def run_confidence_dap(
     # Phase 0: Scatter z + broadcast small data to all GPUs
     # ══════════════════════════════════════════════════════════════════
 
-    # z_holder is a list [z_tensor] — extract z and clear holder after scatter
-    # to break the caller's reference to the full z tensor.
-    z = z_holder[0] if isinstance(z_holder, list) else z_holder
+    # z was already extracted from z_holder above (before multiplicity branch)
 
     if dap_rank == 0:
         N = z.shape[1]
@@ -218,6 +232,7 @@ def run_confidence_dap(
         z_chunk = torch.empty(B, chunk_N, N, D_z, dtype=torch.bfloat16, device=device)
         torch.distributed.recv(z_chunk, src=0)
         z_chunk = z_chunk.float()
+        torch.cuda.empty_cache()  # Release stale trunk-era reserved memory
 
     # Broadcast small 1D data: s, s_inputs, mask
     if dap_rank != 0:
@@ -491,6 +506,21 @@ def run_confidence_dap(
 
     _cmem("pre-PF done, PF start")
 
+    # ── Offload feats to CPU on rank 0 before PF ──
+    # Phase 1 broadcasts are done; feats only needed post-PF for Phase 3.
+    # R0 has 43GB alloc + 59.5GB reserved → only 18.8GB free.
+    # Offloading feats (~10GB) + empty_cache (reclaims 16.5GB reserved gap)
+    # gives R0 ~45GB free — enough for tri-mul's 21.7GB transient.
+    feats_cpu = {}
+    if dap_rank == 0:
+        for key in list(feats.keys()):
+            if isinstance(feats[key], torch.Tensor) and feats[key].is_cuda:
+                feats_cpu[key] = feats[key].cpu()
+                feats[key] = feats_cpu[key]  # replace with CPU ref
+    # Release reserved-but-unused CUDA blocks on ALL ranks
+    torch.cuda.empty_cache()
+    _cmem("feats offloaded + cache cleared")
+
     # ══════════════════════════════════════════════════════════════════
     # Phase 2: DAP Pairformer (all GPUs) — unchanged
     # ══════════════════════════════════════════════════════════════════
@@ -501,10 +531,10 @@ def run_confidence_dap(
 
     from boltz.data import const
     if not pf.training:
-        if N > const.chunk_size_threshold:
-            chunk_size_tri_attn = 128
+        if N > 2000:
+            chunk_size_tri_attn = 16  # 9MME: 128 → ~44GB transient, 16 → ~5.5GB
         else:
-            chunk_size_tri_attn = 512
+            chunk_size_tri_attn = 128
     else:
         chunk_size_tri_attn = None
 
@@ -517,6 +547,14 @@ def run_confidence_dap(
         _cmem(f"  conf PF layer[{li}]")
 
     _cmem("PF done")
+
+    # ── Reload feats to GPU on rank 0 for Phase 3 heads ──
+    if dap_rank == 0 and feats_cpu:
+        for key in feats_cpu:
+            feats[key] = feats_cpu[key].cuda()
+        del feats_cpu
+        torch.cuda.empty_cache()
+        _cmem("feats reloaded to GPU")
 
     # ══════════════════════════════════════════════════════════════════
     # Phase 3: Distributed confidence heads — PAE on chunks, PDE on gathered z

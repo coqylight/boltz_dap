@@ -105,6 +105,7 @@ class GPUMonitor:
 @click.option("--diffusion_samples", type=int, default=1)
 @click.option("--use_msa_server", is_flag=True)
 @click.option("--no_kernels", is_flag=True, help="Disable cuequivariance CUDA kernels (use PyTorch-native ops)")
+@click.option("--use_potentials", is_flag=True, help="Enable FK steering + physical guidance potentials")
 @click.option("--seed", type=int, default=None, help="Random seed for deterministic runs")
 def main(
     data: str,
@@ -115,6 +116,7 @@ def main(
     diffusion_samples: int = 1,
     use_msa_server: bool = False,
     no_kernels: bool = False,
+    use_potentials: bool = False,
     seed: int = None,
 ):
     """Run Boltz 2 with proper FastFold-style DAP (no model duplication)."""
@@ -242,6 +244,10 @@ def main(
     pairformer_args = PairformerArgsV2()
     msa_args = MSAModuleArgs()
     steering_args = BoltzSteeringParams()
+    if use_potentials:
+        steering_args.fk_steering = True
+        steering_args.physical_guidance_update = True
+        rank_print(f"  ✓ Potentials enabled: FK steering + physical guidance")
 
     predict_args = {
         "recycling_steps": recycling_steps,
