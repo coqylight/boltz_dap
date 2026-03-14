@@ -936,11 +936,16 @@ def _make_dap_forward(model):
                         torch.cuda.empty_cache()
 
                 if dap_rank == 0:
-                    # ── Restore z to GPU for confidence module ──
-                    z = z_cpu.cuda()
-                    dict_out["z"] = z
-                    del z_cpu
-                    _mem_log("after structure_module (offloaded, z restored)")
+                    # When DAP>1: keep z on CPU so run_confidence_dap can scatter-from-CPU (avoids OOM).
+                    # When single GPU: need z on GPU for model.confidence_module().
+                    if dap_size > 1:
+                        dict_out["z"] = z_cpu
+                        _mem_log("after structure_module (offloaded, z kept on CPU for confidence DAP)")
+                    else:
+                        z = z_cpu.cuda()
+                        dict_out["z"] = z
+                        del z_cpu
+                        _mem_log("after structure_module (offloaded, z restored)")
 
                     if model.predict_bfactor:
                         dict_out["bfactors_logits"] = model.bfactor_module(s)
@@ -984,11 +989,13 @@ def _make_dap_forward(model):
                             model.confidence_module.cuda()
                         _mem_log("  confidence module reloaded to GPU")
 
-                        # Pass z via mutable list — run_confidence_dap clears
-                        # z_holder[0] after scatter, breaking our last GPU ref
-                        # to the full z (~1.2 GB freed mid-confidence).
-                        z_holder = [z]
-                        del z  # our local ref gone; z_holder[0] is the last one
+                        # Pass z via mutable list — run_confidence_dap clears z_holder[0] after scatter.
+                        # Fix (job 353074): Rank 1,2,3 never have z_cpu in scope → use [None] to avoid
+                        # UnboundLocalError. Only Rank 0 has z_cpu (kept on CPU for scatter-from-CPU in DAP).
+                        if dap_rank == 0:
+                            z_holder = [z_cpu]
+                        else:
+                            z_holder = [None]
                         confidence_output = run_confidence_dap(
                             model,
                             s_inputs=s_inputs,

@@ -26,6 +26,18 @@ from boltz_distributed.core import get_dap_size, get_dap_rank
 
 from dap_pairformer import DAPPairformerLayer
 
+# Diagnostic: sequential inner-call index (set by outer loop, read after broadcast to debug shape corruption)
+_DEBUG_CONF_CALL_IDX = [0]
+
+
+def _dict_tensors_to_cpu(obj):
+    """Recursively move tensors in nested dict to CPU (for pair_chains_iptm)."""
+    if isinstance(obj, torch.Tensor):
+        return obj.cpu() if obj.is_cuda else obj
+    if isinstance(obj, dict):
+        return {k: _dict_tensors_to_cpu(v) for k, v in obj.items()}
+    return obj
+
 
 def inject_dap_into_confidence(confidence_module):
     """Replace confidence module's pairformer layers with DAP wrappers.
@@ -125,46 +137,86 @@ def run_confidence_dap(
         # Only rank 0 has z; assert batch=1 only there
         if dap_rank == 0:
             assert z.shape[0] == 1, "Not supported with batch size > 1"
-        out_dicts = []
-        for sample_idx in range(multiplicity):
-            # Rank 0: slice x_pred for this sample; others: pass empty tensor
-            if dap_rank == 0:
-                x_pred_i = x_pred[sample_idx : sample_idx + 1]
-            else:
-                x_pred_i = x_pred  # empty tensor on non-primary ranks
-            out_dicts.append(
-                run_confidence_dap(
-                    model,
-                    s_inputs, s, z,  # pass z directly (not list) to avoid clearing
-                    x_pred_i,
-                    feats,
-                    pred_distogram_logits,
-                    multiplicity=1,
-                    run_sequentially=False,
-                    use_kernels=use_kernels,
-                )
-            )
-        # Merge outputs (only rank 0 has meaningful outputs)
         if dap_rank == 0:
-            out_dict = {}
-            for key in out_dicts[0]:
-                if key != "pair_chains_iptm":
-                    out_dict[key] = torch.cat([out[key] for out in out_dicts], dim=0)
+            # Rank 0: avoid holding 25 full outputs in memory (OOM on hexamer).
+            # Run first sample, pre-allocate merged buffers, then fill in remaining samples.
+            _DEBUG_CONF_CALL_IDX[0] = 0
+            x_pred_0 = x_pred[0:1]
+            out_0 = run_confidence_dap(
+                model, s_inputs, s, z, x_pred_0, feats, pred_distogram_logits,
+                multiplicity=1, run_sequentially=False, use_kernels=use_kernels,
+            )
+            # Keep merged on CPU so GPU only holds one confidence run at a time (avoids OOM on hexamer).
+            merged = {}
+            pair_chains_list = []
+            for key in out_0:
+                val0 = out_0[key]
+                if val0 is None:
+                    merged[key] = None
+                elif key == "pair_chains_iptm":
+                    pair_chains_list.append(_dict_tensors_to_cpu(val0))
+                elif isinstance(val0, torch.Tensor):
+                    # val0 has leading batch dim (1, ...); merged stacks over multiplicity without that dim.
+                    merged[key] = torch.empty(
+                        (multiplicity,) + val0.shape[1:],
+                        dtype=val0.dtype,
+                        device="cpu",
+                    )
+                    merged[key][0].copy_(val0[0].cpu())
                 else:
-                    pair_chains_iptm = {}
-                    for chain_idx1 in out_dicts[0][key]:
-                        chains_iptm = {}
-                        for chain_idx2 in out_dicts[0][key][chain_idx1]:
-                            chains_iptm[chain_idx2] = torch.cat(
-                                [out[key][chain_idx1][chain_idx2] for out in out_dicts],
-                                dim=0,
-                            )
-                        pair_chains_iptm[chain_idx1] = chains_iptm
-                    out_dict[key] = pair_chains_iptm
+                    merged[key] = [val0]
+            del out_0
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            for sample_idx in range(1, multiplicity):
+                _DEBUG_CONF_CALL_IDX[0] = sample_idx
+                x_pred_i = x_pred[sample_idx : sample_idx + 1]
+                out_i = run_confidence_dap(
+                    model, s_inputs, s, z, x_pred_i, feats, pred_distogram_logits,
+                    multiplicity=1, run_sequentially=False, use_kernels=use_kernels,
+                )
+                for key in out_i:
+                    vali = out_i[key]
+                    if vali is None:
+                        pass
+                    elif key == "pair_chains_iptm":
+                        pair_chains_list.append(_dict_tensors_to_cpu(vali))
+                    elif isinstance(vali, torch.Tensor):
+                        merged[key][sample_idx].copy_(vali[0].cpu())
+                del out_i
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            # Build final out_dict: merged tensors as-is; pair_chains_iptm from list
+            out_dict = {}
+            for key in merged:
+                if merged[key] is None:
+                    out_dict[key] = None
+                elif isinstance(merged[key], torch.Tensor):
+                    out_dict[key] = merged[key]
+                else:
+                    out_dict[key] = merged[key][0]  # fallback single value
+            if pair_chains_list:
+                pair_chains_iptm = {}
+                for chain_idx1 in pair_chains_list[0]:
+                    chains_iptm = {}
+                    for chain_idx2 in pair_chains_list[0][chain_idx1]:
+                        chains_iptm[chain_idx2] = torch.cat(
+                            [pair_chains_list[i][chain_idx1][chain_idx2] for i in range(multiplicity)],
+                            dim=0,
+                        )
+                    pair_chains_iptm[chain_idx1] = chains_iptm
+                out_dict["pair_chains_iptm"] = pair_chains_iptm
             return out_dict
         else:
-            # Non-primary ranks return last result (not used by caller)
-            return out_dicts[-1] if out_dicts else {}
+            # Non-primary ranks: run all calls (no output collection)
+            for sample_idx in range(multiplicity):
+                _DEBUG_CONF_CALL_IDX[0] = sample_idx
+                x_pred_i = x_pred  # empty on non-zero ranks
+                run_confidence_dap(
+                    model, s_inputs, s, z, x_pred_i, feats, pred_distogram_logits,
+                    multiplicity=1, run_sequentially=False, use_kernels=use_kernels,
+                )
+            return {}
 
     # ── Memory logging helper ──────────────────────────────────────────
     import time as _time
@@ -186,20 +238,45 @@ def run_confidence_dap(
     # ══════════════════════════════════════════════════════════════════
 
     # z was already extracted from z_holder above (before multiplicity branch)
+    z_on_cpu = getattr(z, "device", None) and str(z.device).startswith("cpu")
 
     if dap_rank == 0:
         N = z.shape[1]
         B = z.shape[0]
         D_z = z.shape[3]
         D_s = s.shape[2]
-        shape_tensor = torch.tensor([B, N, D_z, D_s], device=z.device)
+        shape_tensor = torch.tensor(
+            [B, N, D_z, D_s], dtype=torch.long, device="cuda:0"
+        )
     else:
         shape_tensor = torch.zeros(4, dtype=torch.long, device=f'cuda:{dap_rank}')
 
     torch.distributed.broadcast(shape_tensor, src=0)
-    B, N, D_z, D_s = shape_tensor.tolist()
-    N, D_z, D_s = int(N), int(D_z), int(D_s)
-    B = int(B)
+    # On rank 1: compare GPU .tolist() vs .cpu().tolist() before using (to pinpoint .tolist() vs broadcast/sync cause)
+    if dap_rank == 1:
+        _gpu_list = shape_tensor.tolist()
+    raw_list = shape_tensor.cpu().tolist()
+    if dap_rank == 1:
+        if _gpu_list != raw_list:
+            print(
+                f"    [CONF SHAPE diag] rank=1 call_idx={_DEBUG_CONF_CALL_IDX[0]} GPU_tolist={_gpu_list} CPU_tolist={raw_list} MISMATCH",
+                flush=True,
+            )
+    # Use raw_list (from .cpu().tolist()) for reliable Python ints
+    B, N, D_z, D_s = int(raw_list[0]), int(raw_list[1]), int(raw_list[2]), int(raw_list[3])
+    # Guard against corrupted/overflowed dimensions (e.g. from bad broadcast on non-zero ranks)
+    if not (0 < B <= 1000 and 0 < N <= 100000 and 0 < D_z <= 2048 and 0 < D_s <= 2048):
+        raise ValueError(
+            f"Invalid shape after broadcast: B={B} N={N} D_z={D_z} D_s={D_s} (dap_rank={dap_rank}). "
+            "Check that z_holder is correct on rank 0 and that sequential calls pass z per sample."
+        )
+    # Diagnostic: compare Rank 0 vs Rank 1 shape after broadcast (to pinpoint .tolist() vs buffer/sync cause)
+    if dap_rank in (0, 1):
+        _diag_call = _DEBUG_CONF_CALL_IDX[0]
+        print(
+            f"    [CONF SHAPE diag] rank={dap_rank} call_idx={_diag_call} raw_list={raw_list} -> B={B} N={N} D_z={D_z} D_s={D_s}",
+            flush=True,
+        )
 
     # Pad N to be divisible by dap_size
     N_padded = ((N + dap_size - 1) // dap_size) * dap_size
@@ -208,21 +285,35 @@ def run_confidence_dap(
     row_end = row_start + chunk_N
 
     # Scatter z: each GPU gets [B, chunk_N, N, D_z]
+    # When z is on CPU (Rank 0), scatter chunk-by-chunk so full z is never on GPU (avoids OOM).
     if dap_rank == 0:
-        if N_padded != N:
-            z_padded = torch.nn.functional.pad(z, (0, 0, 0, 0, 0, N_padded - N))
+        if z_on_cpu:
+            if N_padded != N:
+                z = torch.nn.functional.pad(z, (0, 0, 0, 0, 0, N_padded - N))
+            for r in range(1, dap_size):
+                start = r * chunk_N
+                end = start + chunk_N
+                chunk = z[:, start:end, :, :].contiguous()
+                chunk_bf16 = chunk.bfloat16().cuda()
+                torch.distributed.send(chunk_bf16, dst=r)
+                del chunk_bf16, chunk
+            chunk0 = z[:, :chunk_N, :, :].contiguous()
+            z_chunk = chunk0.bfloat16().cuda().float()
+            del chunk0
         else:
-            z_padded = z
-        z_bf16 = z_padded.bfloat16()
-        del z_padded
-        for r in range(1, dap_size):
-            start = r * chunk_N
-            end = start + chunk_N
-            chunk = z_bf16[:, start:end, :, :].contiguous()
-            torch.distributed.send(chunk, dst=r)
-        z_chunk = z_bf16[:, :chunk_N, :, :].contiguous().float()
-        del z_bf16, z
-        # Clear holder to break the caller's last reference to full z
+            if N_padded != N:
+                z_padded = torch.nn.functional.pad(z, (0, 0, 0, 0, 0, N_padded - N))
+            else:
+                z_padded = z
+            z_bf16 = z_padded.bfloat16()
+            del z_padded
+            for r in range(1, dap_size):
+                start = r * chunk_N
+                end = start + chunk_N
+                chunk = z_bf16[:, start:end, :, :].contiguous()
+                torch.distributed.send(chunk, dst=r)
+            z_chunk = z_bf16[:, :chunk_N, :, :].contiguous().float()
+            del z_bf16, z
         if isinstance(z_holder, list):
             z_holder[0] = None
         torch.cuda.empty_cache()
@@ -577,23 +668,93 @@ def run_confidence_dap(
 
     _cmem("PAE computed + gathered")
 
-    # 3b. Gather z for PDE (needs z + z.T — requires all rows)
-    z = gather(z_chunk.contiguous(), dim=1, original_size=N)  # [B, N, N, 128]
-    del z_chunk
-
-    # Gather d_chunk → full d (collective)
+    # Gather d_chunk → full d (collective, small)
     d_full = gather(d_chunk.contiguous(), dim=1, original_size=N)
     del d_chunk
 
-    _cmem("z + d gathered")
+    # 3b. Chunked PDE on Rank 0 (never gather full z — avoids OOM on hexamer)
+    # For each row chunk: R0 receives that row chunk + gathers column chunk from all ranks, computes z_sym and PDE.
+    D_z_chunk = z_chunk.shape[3]
+    if dap_rank == 0 and heads.use_separate_heads:
+        asym_id_token = feats["asym_id"]
+        is_same_chain = (asym_id_token.unsqueeze(-1) == asym_id_token.unsqueeze(-2)).float()
+        is_different_chain = 1.0 - is_same_chain
+    pde_list = []
+    for r_idx in range(dap_size):
+        _cmem(f"chunked PDE r_idx={r_idx}/{dap_size} start")
+        r_start = r_idx * chunk_N
+        r_end = r_start + chunk_N
+        # Last column chunk may be shorter when N is not divisible (e.g. N=1557 → 1170:1557 has 387 cols)
+        r_end_col = min(r_end, N)
+        col_chunk_size = r_end_col - r_start
 
-    # 3c. GPU 0: compute PDE, free z, then run metrics
+        # Row chunk size for this r_idx: last rank can have fewer rows when N_padded != N
+        row_chunk_r = (N - (dap_size - 1) * chunk_N) if (r_idx == dap_size - 1 and N_padded != N) else chunk_N
+
+        if dap_rank == 0:
+            z_row = torch.empty(B, row_chunk_r, N, D_z_chunk, dtype=z_chunk.dtype, device=z_chunk.device)
+        torch.distributed.barrier()
+        # Send only row_chunk_r rows: last rank has z_chunk [B, 390, N, D] but only 387 are valid (row_chunk_r)
+        if dap_rank == r_idx and r_idx != 0:
+            torch.distributed.send(z_chunk[:, :row_chunk_r, :, :].contiguous(), dst=0)
+        if dap_rank == 0:
+            if r_idx == 0:
+                z_row.copy_(z_chunk)
+            else:
+                torch.distributed.recv(z_row, src=r_idx)
+        torch.distributed.barrier()
+        # Gather columns [r_start:r_end_col] from all ranks → z_col [B, N, col_chunk_size, D]
+        if dap_rank == 0:
+            z_col_parts = []
+            for k in range(dap_size):
+                row_k = (N - (dap_size - 1) * chunk_N) if (k == dap_size - 1 and N_padded != N) else chunk_N
+                if k == 0:
+                    z_col_parts.append(z_chunk[:, :, r_start:r_end_col, :].clone())
+                else:
+                    buf = torch.empty(B, row_k, col_chunk_size, D_z_chunk, dtype=z_chunk.dtype, device="cuda:0")
+                    torch.distributed.recv(buf, src=k)
+                    z_col_parts.append(buf)
+            z_col = torch.cat(z_col_parts, dim=1)
+            del z_col_parts
+            if N_padded != N:
+                z_col = z_col[:, :N, :, :]
+        else:
+            # Send only row_self rows so recv buffer (B, row_k, col_chunk_size, D) on R0 matches
+            row_self = (N - (dap_size - 1) * chunk_N) if (dap_rank == dap_size - 1 and N_padded != N) else chunk_N
+            torch.distributed.send(
+                z_chunk[:, :row_self, r_start:r_end_col, :].contiguous(), dst=0
+            )
+        if dap_rank == 0:
+            z_sym_chunk = z_row + z_col.permute(0, 2, 1, 3)
+            del z_row, z_col
+            if heads.use_separate_heads:
+                pde_intra_c = heads.to_pde_intra_logits(z_sym_chunk)
+                pde_inter_c = heads.to_pde_inter_logits(z_sym_chunk)
+                m_same = is_same_chain[:, r_start:r_end_col, :].unsqueeze(-1)
+                m_diff = is_different_chain[:, r_start:r_end_col, :].unsqueeze(-1)
+                pde_c = pde_intra_c * m_same + pde_inter_c * m_diff
+                del pde_intra_c, pde_inter_c, m_same, m_diff
+            else:
+                pde_c = heads.to_pde_logits(z_sym_chunk)
+            del z_sym_chunk
+            pde_list.append(pde_c)
+        _cmem(f"chunked PDE r_idx={r_idx}/{dap_size} done")
+    del z_chunk
+    if dap_rank == 0:
+        pde_logits = torch.cat(pde_list, dim=1)
+        del pde_list
+        if N_padded != N:
+            pde_logits = pde_logits[:, :N, :N, :].contiguous()
+    torch.distributed.barrier()
+    _cmem("chunked PDE done")
+
+    # 3c. GPU 0: run metrics (no full z)
     if dap_rank == 0:
         out_dict = {}
 
         if conf.return_latent_feats:
             out_dict["s_conf"] = s
-            out_dict["z_conf"] = z
+            out_dict["z_conf"] = None  # not kept to save memory
 
         # Apply intra/inter masks for separate heads PAE
         if heads.use_separate_heads:
@@ -604,22 +765,7 @@ def run_confidence_dap(
                          + pae_inter_logits * is_different_chain.float().unsqueeze(-1))
             del pae_intra_logits, pae_inter_logits
 
-        # Compute PDE logits from z + z.T, then free z immediately
-        z_sym = z + z.transpose(1, 2)
-        if not conf.return_latent_feats:
-            del z  # free z now — it's not needed anymore
-        if heads.use_separate_heads:
-            pde_intra = heads.to_pde_intra_logits(z_sym)
-            pde_inter = heads.to_pde_inter_logits(z_sym)
-            del z_sym
-            pde_logits = (pde_intra * is_same_chain.float().unsqueeze(-1)
-                         + pde_inter * is_different_chain.float().unsqueeze(-1))
-            del pde_intra, pde_inter
-        else:
-            pde_logits = heads.to_pde_logits(z_sym)
-            del z_sym
-
-        _cmem("PDE done, z freed")
+        _cmem("PDE done")
 
         # s-only heads
         resolved_logits = heads.to_resolved_logits(s)
