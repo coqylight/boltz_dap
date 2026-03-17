@@ -1,18 +1,18 @@
 # Boltz-DAP: Distributed Axial Parallelism for Boltz 2
 
-> Run [Boltz 2](https://github.com/jwohlwend/boltz) protein structure prediction on large complexes (hexamers, pentamers) that OOM on a single GPU.
+> Run [Boltz 2](https://github.com/jwohlwend/boltz) protein structure prediction on large complexes (>2,000 amino acid residues) across multiple GPUs without OOM.
 
 DAP (**D**ynamic **A**xial **P**arallelism) shards the pair representation `z [B, N, N, D]` across multiple GPUs along the row dimension, so no single GPU ever holds the full N×N tensor. This reduces peak memory proportionally to the number of GPUs — **4 GPUs → ~4× less memory per GPU**.
 
 ## Why?
 
-Original Boltz 2 holds the full pair tensor on **1 GPU**. For large complexes:
+Original Boltz-2 holds the full pair representation tensor on **1 GPU**. For large complexes (>2,000 residues), this leads to CUDA out-of-memory (OOM) errors in consumer grade GPUs (VRAM < 48 GB). DAP enables Boltz-2 to run on **multiple GPUs** without OOM, even for large complexes like adeno-associated virus (AAV) hexamers.
 
 | Complex | N (tokens) | Original Boltz 2 | DAP (4 GPUs) |
 |---------|-----------|------------------|--------------|
-| Trimer (3 × 519 aa) | ~1,557 | ⚠️ Tight | ✅ ~12 GB/GPU |
-| Pentamer (5 × 519 aa) | ~2,595 | ❌ OOM | ✅ ~36 GB/GPU |
-| Hexamer (6 × 519 aa) | ~3,114 | ❌ OOM | ✅ ~45 GB/GPU |
+| AAV2 Trimer (3 × 519 aa) | ~1,557 | ⚠️ Tight | ✅ ~12 GB/GPU |
+| AAV2 Pentamer (5 × 519 aa) | ~2,595 | ❌ OOM | ✅ ~36 GB/GPU |
+| AAV2 Hexamer (6 × 519 aa) | ~3,114 | ❌ OOM | ✅ ~45 GB/GPU |
 
 ## How It Works
 
@@ -66,11 +66,11 @@ The full `z` is only materialized at scatter/gather boundaries. The entire trunk
 | CUDA | Compatible with PyTorch 2.x |
 | GPU counts tested | 2, 4, 8 GPUs (e.g. trimer/hexamer on 4; 9MME N≈4642 on 8) |
 | Settings tested | **Boltz2 default**: `recycling_steps=3`, `sampling_steps=200`, `diffusion_samples=1` · **AF3 default**: `recycling_steps=10`, `sampling_steps=200`, `diffusion_samples=25` |
-| Workloads | Trimer (e.g. 3×519 aa), hexamer (6×~519 aa, 25 samples with `--use_flex_attention_chunked`), 9MME (N≈4642, 8 GPUs) |
+| Workloads | AAV2 Trimer (e.g. 3×519 aa), AAV2 Hexamer (6×~519 aa, 25 samples with `--use_flex_attention_chunked`), 9MME (N≈4642, 8 GPUs) |
 
 Other GPU models (A100, V100, etc.) should work with 2+ GPUs; memory per GPU scales with shard size.
 
-**Example log file:** [example_hexamer_25cif_full.log](example_hexamer_25cif_full.log) — full run that produced 25 CIF files (hexamer, 4 GPUs, `--use_flex_attention_chunked`, AF3 defaults). Large (~8.8 MB) but useful as a reference.
+**Example log file:** [example_hexamer_25cif_full.log](example_hexamer_25cif_full.log) — full run that produced 25 CIF files (AAV2 Hexamer, 4 GPUs, `--use_flex_attention_chunked`, AF3 defaults). Large (~8.8 MB) but useful as a reference.
 
 ### Running
 
@@ -198,4 +198,17 @@ This DAP wrapper follows the same license as Boltz 2.
 
 ## Further Advancement
 
-for any inquiry or help please email gleeai@connect.ust.hk I would be happy to help with anything I could
+For any inquiries, please email {gleeai, wjkimab}@connect.ust.hk, we would be happy to help with anything we could.
+
+## Acknowledgements
+
+We sincerely thank:
+- the original Boltz-2 team for fully open-sourcing their state-of-the-art biomolecular structure prediction,
+- the FastFold team for their open-source distributed communication utilities,
+- the AlphaFold 3 team for open-sourcing their inference code and model weights,
+- the deep learning for protein structure prediction and the broader AI for Science communities for their ongoing contributions in this exciting field, and
+- the developers and maintainers of all the packages used in this project!
+
+This project was developed with generous compute support in HKUST HPC4 and SuperPOD from The Hong Kong University of Science and Technology (HKUST). This work was conducted at the lab of Prof. Bonnie Danqing Zhu in the Department of Chemical and Biological Engineering (CBE). 
+
+We note the parallel development of [Fold-CP](https://github.com/NVIDIA-Digital-Bio/boltz-cp) by the team at NVIDIA Digital Bio, which also enables multi-GPU Boltz 2 inference (and also training) with a different approach. We look forward to comparing and learning from each other's implementations!
