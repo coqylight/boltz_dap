@@ -195,3 +195,7 @@ DAP produces results with minor floating-point differences from single-GPU Boltz
 ## License
 
 This DAP wrapper follows the same license as Boltz 2.
+
+## Further Advancement
+
+for any inquiry or help please email gleeai@connect.ust.hk I would be happy to help with anything I could
