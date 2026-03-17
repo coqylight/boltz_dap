@@ -10,9 +10,9 @@ Original Boltz-2 holds the full pair representation tensor on **1 GPU**. For lar
 
 | Complex | N (tokens) | Original Boltz-2 | DAP (4 GPUs) |
 |---------|-----------|------------------|--------------|
-| AAV2 Trimer (3 × 519 aa) | ~1,557 | ⚠️ Tight | ✅ ~12 GB/GPU |
-| AAV2 Pentamer (5 × 519 aa) | ~2,595 | ❌ OOM | ✅ ~36 GB/GPU |
-| AAV2 Hexamer (6 × 519 aa) | ~3,114 | ❌ OOM | ✅ ~45 GB/GPU |
+| AAV2 VP3 Trimer (3 × 519 aa) | ~1,557 | ⚠️ Tight | ✅ ~12 GB/GPU |
+| AAV2 VP3 Pentamer (5 × 519 aa) | ~2,595 | ❌ OOM | ✅ ~36 GB/GPU |
+| AAV2 VP3 Hexamer (6 × 519 aa) | ~3,114 | ❌ OOM | ✅ ~45 GB/GPU |
 
 ## How It Works
 
@@ -66,11 +66,11 @@ The full `z` is only materialized at scatter/gather boundaries. The entire trunk
 | CUDA | Compatible with PyTorch 2.x |
 | GPU counts tested | 2, 4, 8 GPUs (e.g. trimer/hexamer on 4; 9MME N≈4642 on 8) |
 | Settings tested | **Boltz2 default**: `recycling_steps=3`, `sampling_steps=200`, `diffusion_samples=1` · **AF3 default**: `recycling_steps=10`, `sampling_steps=200`, `diffusion_samples=25` |
-| Workloads | AAV2 Trimer (e.g. 3×519 aa), AAV2 Hexamer (6×~519 aa, 25 samples with `--use_flex_attention_chunked`), 9MME (N≈4642, 8 GPUs) |
+| Workloads | AAV2 VP3 Trimer (e.g. 3×519 aa), AAV2 VP3 Hexamer (6×~519 aa, 25 samples with `--use_flex_attention_chunked`), 9MME (N≈4642, 8 GPUs) |
 
 Other GPU models (A100, V100, etc.) should work with 2+ GPUs; memory per GPU scales with shard size.
 
-**Example log file:** [example_hexamer_25cif_full.log](example_hexamer_25cif_full.log) — full run that produced 25 CIF files (AAV2 Hexamer, 4 GPUs, `--use_flex_attention_chunked`, AF3 defaults). Large (~8.8 MB) but useful as a reference.
+**Example log file:** [example_hexamer_25cif_full.log](example_hexamer_25cif_full.log) — full run that produced 25 CIF files (AAV2 VP3 Hexamer, 4 GPUs, `--use_flex_attention_chunked`, AF3 defaults). Large (~8.8 MB) but useful as a reference.
 
 ### Running
 
@@ -196,7 +196,7 @@ We would also appreciate it if you could cite this repository in any work that u
 
 ## License
 
-This DAP wrapper follows the same license as Boltz-2.
+This DAP wrapper follows the same MIT license as Boltz-2.
 
 ## Further Advancement
 
