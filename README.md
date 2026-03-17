@@ -198,4 +198,10 @@ This DAP wrapper follows the same license as Boltz 2.
 
 ## Further Advancement
 
-for any inquiry or help please email gleeai@connect.ust.hk I would be happy to help with anything I could
+For any inquiries, please email {gleeai, wjkimab}@connect.ust.hk, we would be happy to help with anything we could.
+
+## Acknowledgements
+
+We thank the original Boltz 2 authors for open-sourcing their incredible work on protein structure prediction. We thank the FastFold team for their open-source distributed communication utilities. We thank the deep learning for protein structure prediction and the broader AI for Science communities for their ongoing contributions in this exciting field. Last but not least, we sincerely thank the developers and maintainers of all the packages used in this project.
+
+This project was developed with generous compute support in HKUST HPC4 and SuperPOD from The Hong Kong University of Science and Technology (HKUST). This work was conducted at the lab of Prof. Bonnie Danqing Zhu in the Department of Chemical and Biological Engineering (CBE). 
