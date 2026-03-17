@@ -205,10 +205,10 @@ For any inquiries, please email {gleeai, wjkimab}@connect.ust.hk, we would be ha
 ## Acknowledgements
 
 We sincerely thank:
-- the original Boltz-2 team for fully open-sourcing their state-of-the-art biomolecular structure prediction,
+- the original Boltz-2 team for fully open-sourcing their state-of-the-art biomolecular structure prediction models,
 - the FastFold team for their open-source distributed communication utilities,
 - the AlphaFold 3 team for open-sourcing their inference code and model weights,
-- the deep learning for protein structure prediction and the broader AI for Science communities for their ongoing contributions in this exciting field, and
+- the deep learning for biomolecular interaction modeling and the broader AI for Science communities for their ongoing contributions in this exciting field, and
 - the developers and maintainers of all the packages used in this project!
 
 This project was developed with generous compute support in HKUST HPC4 and SuperPOD from The Hong Kong University of Science and Technology (HKUST). This work was conducted at the lab of Prof. Bonnie Danqing Zhu in the Department of Chemical and Biological Engineering (CBE). 
