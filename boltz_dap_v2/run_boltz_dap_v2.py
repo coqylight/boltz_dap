@@ -105,6 +105,8 @@ class GPUMonitor:
 @click.option("--diffusion_samples", type=int, default=1)
 @click.option("--use_msa_server", is_flag=True)
 @click.option("--no_kernels", is_flag=True, help="Disable cuequivariance CUDA kernels (use PyTorch-native ops)")
+@click.option("--use_flex_attention", is_flag=True, help="Use FlexAttention for triangle attention (memory/throughput)")
+@click.option("--use_flex_attention_chunked", is_flag=True, help="Use chunked FlexAttention for DAP (experimental; avoids 112GB OOM)")
 @click.option("--use_potentials", is_flag=True, help="Enable FK steering + physical guidance potentials")
 @click.option("--seed", type=int, default=None, help="Random seed for deterministic runs")
 def main(
@@ -116,6 +118,8 @@ def main(
     diffusion_samples: int = 1,
     use_msa_server: bool = False,
     no_kernels: bool = False,
+    use_flex_attention: bool = False,
+    use_flex_attention_chunked: bool = False,
     use_potentials: bool = False,
     seed: int = None,
 ):
@@ -274,6 +278,31 @@ def main(
     model.eval()
 
     rank_print(f"  ✓ Model loaded to CPU (all ranks)")
+
+    # ── Optional: FlexAttention for triangle attention (before DAP injection) ──
+    if use_flex_attention_chunked:
+        try:
+            from flex_attention_patch_chunked import patch_triangle_attention
+            n_patched = patch_triangle_attention(model)
+            rank_print(f"  ✓ FlexAttention (chunked) patched onto {n_patched} TriangleAttention layers")
+        except Exception as e:
+            import traceback
+            rank_print(f"  ⚠ FlexAttention chunked patch skipped: {e}")
+            traceback.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
+    elif use_flex_attention:
+        try:
+            from flex_attention_patch import patch_triangle_attention
+            n_patched = patch_triangle_attention(model)
+            rank_print(f"  ✓ FlexAttention patched onto {n_patched} TriangleAttention layers")
+        except Exception as e:
+            import traceback
+            rank_print(f"  ⚠ FlexAttention patch skipped: {e}")
+            rank_print("  FlexAttention patch traceback (to locate 'duplicate template name'):")
+            traceback.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
 
     # ── Selective GPU placement ──────────────────────────────────────────
     # GPU 0: gets the FULL model (trunk + post-trunk)

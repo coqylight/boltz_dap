@@ -78,11 +78,17 @@ torchrun --nproc_per_node=2 boltz_dap_v2/run_boltz_dap_v2.py \
 |------|---------|-------------|
 | `--out_dir` | (required) | Output directory |
 | `--cache` | `~/.boltz` | Model weights cache |
-| `--recycling_steps` | 3 | Number of recycling iterations |
+| `--recycling_steps` | 3 | Number of recycling iterations (AF3-style default) |
 | `--sampling_steps` | 200 | Diffusion sampling steps |
 | `--diffusion_samples` | 1 | Number of diffusion samples |
-| `--no_kernels` | off | Disable cuequivariance CUDA kernels |
+| `--use_msa_server` | off | Use MSA server (e.g. ColabFold) for MSA generation |
+| `--no_kernels` | off | Disable cuequivariance CUDA kernels (PyTorch-native triangle attention) |
+| `--use_flex_attention` | off | Use FlexAttention for triangle attention (memory/throughput; may need chunked on large N) |
+| `--use_flex_attention_chunked` | off | Chunked FlexAttention for DAP (avoids OOM on 25-sample hexamer; numerically matches original) |
+| `--use_potentials` | off | Enable FK steering + physical guidance potentials |
 | `--seed` | None | Random seed for reproducibility |
+
+**Confidence** (pLDDT, pTM, iPTM, PAE, PDE) is always computed when the model supports it; no flag required.
 
 ### SLURM Example
 

@@ -1030,8 +1030,17 @@ def _make_dap_forward(model):
                         )
                     if dap_rank == 0:
                         dict_out.update(confidence_output)
-                        # Move any CPU-offloaded tensors back to GPU for writer
+                        # Move any CPU-offloaded tensors back to GPU for writer.
+                        # Keep large confidence tensors on CPU to avoid OOM (e.g. hexamer 13 samples).
+                        _confidence_cpu_keys = frozenset({
+                            "pae_logits", "pde_logits", "pde", "pae", "plddt",
+                            "complex_pde", "complex_pae", "complex_plddt", "complex_iplddt", "complex_ipde",
+                            "ptm", "iptm", "ligand_iptm", "protein_iptm",
+                            "s_conf", "z_conf",
+                        })
                         for key in list(dict_out.keys()):
+                            if key in _confidence_cpu_keys:
+                                continue
                             if isinstance(dict_out[key], torch.Tensor) and not dict_out[key].is_cuda:
                                 dict_out[key] = dict_out[key].cuda(0)
                     model.confidence_module.cpu()
