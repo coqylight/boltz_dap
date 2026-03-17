@@ -1,6 +1,6 @@
-# Boltz-DAP: Distributed Axial Parallelism for Boltz 2
+# Boltz-DAP: Distributed Axial Parallelism for Boltz-2
 
-> Run [Boltz 2](https://github.com/jwohlwend/boltz) protein structure prediction on large complexes (>2,000 amino acid residues) across multiple GPUs without OOM.
+> Run [Boltz-2](https://github.com/jwohlwend/boltz) protein structure prediction on large complexes (>2,000 amino acid residues) across multiple GPUs without OOM.
 
 DAP (**D**ynamic **A**xial **P**arallelism) shards the pair representation `z [B, N, N, D]` across multiple GPUs along the row dimension, so no single GPU ever holds the full N×N tensor. This reduces peak memory proportionally to the number of GPUs — **4 GPUs → ~4× less memory per GPU**.
 
@@ -8,7 +8,7 @@ DAP (**D**ynamic **A**xial **P**arallelism) shards the pair representation `z [B
 
 Original Boltz-2 holds the full pair representation tensor on **1 GPU**. For large complexes (>2,000 residues), this leads to CUDA out-of-memory (OOM) errors in consumer grade GPUs (VRAM < 48 GB). DAP enables Boltz-2 to run on **multiple GPUs** without OOM, even for large complexes like adeno-associated virus (AAV) hexamers.
 
-| Complex | N (tokens) | Original Boltz 2 | DAP (4 GPUs) |
+| Complex | N (tokens) | Original Boltz-2 | DAP (4 GPUs) |
 |---------|-----------|------------------|--------------|
 | AAV2 Trimer (3 × 519 aa) | ~1,557 | ⚠️ Tight | ✅ ~12 GB/GPU |
 | AAV2 Pentamer (5 × 519 aa) | ~2,595 | ❌ OOM | ✅ ~36 GB/GPU |
@@ -56,7 +56,7 @@ The full `z` is only materialized at scatter/gather boundaries. The entire trunk
 
 - **2+ GPUs** on the same node (NVLink recommended)
 - Python 3.10+, PyTorch 2.x with CUDA
-- [Boltz 2](https://github.com/jwohlwend/boltz) installed (`pip install boltz`)
+- [Boltz-2](https://github.com/jwohlwend/boltz) installed (`pip install boltz`)
 
 ### Tested environment
 
@@ -152,9 +152,9 @@ boltz_dap/
 
 ## Key Design Decisions
 
-### Zero Boltz 2 Modifications
+### Zero Boltz-2 Modifications
 
-DAP **does not modify any original Boltz 2 source code**. Instead, it monkey-patches the model at runtime:
+DAP **does not modify any original Boltz-2 source code**. Instead, it monkey-patches the model at runtime:
 
 ```python
 # dap_trunk.py
@@ -184,17 +184,19 @@ For triangle attention and sequence attention, only the small **bias tensor** `[
 
 ## Numerical Accuracy
 
-DAP produces results with minor floating-point differences from single-GPU Boltz 2, due to different operation ordering in distributed reductions. Structure predictions (LDDT, TM-score) are statistically equivalent.
+DAP produces results with minor floating-point differences from single-GPU Boltz-2, due to different operation ordering in distributed reductions. Structure predictions (LDDT, TM-score) are statistically equivalent.
 
 ## References
-
-- [Boltz 2](https://github.com/jwohlwend/boltz) — Base model
+If you found this project useful, please cite:
+- [Boltz-2](https://github.com/jwohlwend/boltz) — Base model
 - [FastFold](https://github.com/hpcaitech/FastFold) — DAP communication primitives (adapted)
-- [AlphaFold 3](https://doi.org/10.1038/s41586-024-07487-w) — Triangle operations architecture
+- [AlphaFold 3](https://github.com/google-deepmind/alphafold3) — Triangle operations architecture (adapted)
+
+We would also appreciate it if you could cite this repository in any work that uses or builds upon it. A formal citation will be provided in a preprint describing our implementation, benchmarks, and results on our AAV multimer structure prediction with this approach.
 
 ## License
 
-This DAP wrapper follows the same license as Boltz 2.
+This DAP wrapper follows the same license as Boltz-2.
 
 ## Further Advancement
 
@@ -211,4 +213,4 @@ We sincerely thank:
 
 This project was developed with generous compute support in HKUST HPC4 and SuperPOD from The Hong Kong University of Science and Technology (HKUST). This work was conducted at the lab of Prof. Bonnie Danqing Zhu in the Department of Chemical and Biological Engineering (CBE). 
 
-We note the parallel development of [Fold-CP](https://github.com/NVIDIA-Digital-Bio/boltz-cp) by the team at NVIDIA Digital Bio, which also enables multi-GPU Boltz 2 inference (and also training) with a different approach. We look forward to comparing and learning from each other's implementations!
+We note the parallel development of [Fold-CP](https://github.com/NVIDIA-Digital-Bio/boltz-cp) by the team at NVIDIA Digital Bio, which also enables multi-GPU Boltz-2 inference (and also training) with a different approach. We look forward to comparing and learning from each other's implementations!
