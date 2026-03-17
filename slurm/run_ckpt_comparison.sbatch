@@ -40,7 +40,7 @@ echo "[STEP 1/3] Running BASELINE trunk (single GPU, with templates)..."
 echo "============================================================"
 cd "$DAP_DIR"
 CUDA_VISIBLE_DEVICES=0 uv run --project "$BOLTZ_PROJECT" \
-    python run_trunk_only.py "$INPUT" \
+    python "${DAP_DIR}/scripts/run_trunk_only.py" "$INPUT" \
     --out_dir "$BASELINE_OUT" \
     --seed "$SEED" \
     --use_msa_server
@@ -72,7 +72,7 @@ echo "============================================================"
 echo "[STEP 3/3] Comparing checkpoints (baseline w/templates vs DAP)..."
 echo "============================================================"
 cd "$DAP_DIR"
-uv run --project "$BOLTZ_PROJECT" python compare_checkpoints.py \
+uv run --project "$BOLTZ_PROJECT" python "${DAP_DIR}/scripts/compare_checkpoints.py" \
     "$BASELINE_OUT/trunk_checkpoints.pt" \
     "$DAP_OUT/trunk_checkpoints.pt"
 

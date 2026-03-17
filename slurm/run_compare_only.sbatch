@@ -21,7 +21,7 @@ cd $DAP_DIR
 echo "=============================================="
 echo "STEP 6: Compare trunk checkpoints (z/s)"
 echo "=============================================="
-uv run --project $BOLTZ_DIR python compare_checkpoints.py \
+uv run --project $BOLTZ_DIR python "${DAP_DIR}/scripts/compare_checkpoints.py" \
     $BASELINE_TRUNK_DIR/trunk_checkpoints.pt \
     $DAP_TRUNK_DIR/trunk_checkpoints.pt
 
@@ -30,7 +30,7 @@ echo "=============================================="
 echo "STEP 7: Compare GRANULAR template+MSA checkpoints"
 echo "=============================================="
 if [ -f "$BASELINE_TRUNK_DIR/granular_ckpts.pt" ] && [ -f "$DAP_TRUNK_DIR/granular_ckpts.pt" ]; then
-    uv run --project $BOLTZ_DIR python compare_granular.py \
+    uv run --project $BOLTZ_DIR python "${DAP_DIR}/scripts/compare_granular.py" \
         $BASELINE_TRUNK_DIR/granular_ckpts.pt \
         $DAP_TRUNK_DIR/granular_ckpts.pt
 else

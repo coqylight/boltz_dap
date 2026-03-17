@@ -21,7 +21,7 @@ cd $DAP_DIR
 echo "=============================================="
 echo "Compare GRANULAR template+MSA checkpoints"
 echo "=============================================="
-uv run --project $BOLTZ_DIR python compare_granular.py \
+uv run --project $BOLTZ_DIR python "${DAP_DIR}/scripts/compare_granular.py" \
     $BASELINE_TRUNK_DIR/granular_ckpts.pt \
     $DAP_TRUNK_DIR/granular_ckpts.pt
 

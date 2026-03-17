@@ -16,7 +16,7 @@ DAP=/project/engvimmune/gleeai/boltz_output/dap_samedata_trunk_seed42/trunk_chec
 echo "=============================================="
 echo "Comparing trunk checkpoints (z/s)"
 echo "=============================================="
-uv run --project $BOLTZ_DIR python /project/engvimmune/gleeai/boltz_dap/compare_trunk_lazy.py \
+uv run --project $BOLTZ_DIR python /project/engvimmune/gleeai/boltz_dap/scripts/compare_trunk_lazy.py \
     "$BASELINE" "$DAP"
 
 echo ""
@@ -27,7 +27,7 @@ BASELINE_GRAN=/project/engvimmune/gleeai/boltz_output/baseline_samedata_trunk_se
 DAP_GRAN=/project/engvimmune/gleeai/boltz_output/dap_samedata_trunk_seed42/granular_ckpts.pt
 
 if [ -f "$BASELINE_GRAN" ] && [ -f "$DAP_GRAN" ]; then
-    uv run --project $BOLTZ_DIR python /project/engvimmune/gleeai/boltz_dap/compare_trunk_lazy.py \
+    uv run --project $BOLTZ_DIR python /project/engvimmune/gleeai/boltz_dap/scripts/compare_trunk_lazy.py \
         "$BASELINE_GRAN" "$DAP_GRAN"
 else
     echo "Granular checkpoint files not found, skipping."

@@ -11,5 +11,6 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=gleeai@connect.ust.hk
 
-cd /project/engvimmune/gleeai/boltz_dap
-uv run --project /project/engvimmune/gleeai/boltz python analyze_divergence.py
+DAP_DIR=/project/engvimmune/gleeai/boltz_dap
+cd "$DAP_DIR"
+uv run --project /project/engvimmune/gleeai/boltz python "${DAP_DIR}/scripts/analyze_divergence.py"

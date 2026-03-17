@@ -8,7 +8,7 @@ set -e
 YAML="/project/engvimmune/gleeai/boltz_input/1LP3_pentamer_from_tetramer.yaml"
 BASE="/project/engvimmune/gleeai/boltz_output"
 DAP_SCRIPT="/project/engvimmune/gleeai/boltz_dap/boltz_dap_v2/run_boltz_dap_v2.py"
-BASELINE_SCRIPT="/project/engvimmune/gleeai/boltz_dap/run_boltz_baseline.py"
+BASELINE_SCRIPT="/project/engvimmune/gleeai/boltz_dap/scripts/run_boltz_baseline.py"
 SEED=42
 
 echo "============================================================"

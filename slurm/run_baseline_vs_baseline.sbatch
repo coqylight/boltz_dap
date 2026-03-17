@@ -47,7 +47,7 @@ echo "=============================================="
 echo "STEP 2: Run baseline trunk - RUN A"
 echo "=============================================="
 cd $DAP_DIR
-CUDA_VISIBLE_DEVICES=0 uv run --project $BOLTZ_DIR python run_trunk_only.py \
+CUDA_VISIBLE_DEVICES=0 uv run --project $BOLTZ_DIR python "${DAP_DIR}/scripts/run_trunk_only.py" \
     $INPUT_YAML \
     --out_dir $RUN_A \
     --seed 42
@@ -56,7 +56,7 @@ echo ""
 echo "=============================================="
 echo "STEP 3: Run baseline trunk - RUN B (identical)"
 echo "=============================================="
-CUDA_VISIBLE_DEVICES=0 uv run --project $BOLTZ_DIR python run_trunk_only.py \
+CUDA_VISIBLE_DEVICES=0 uv run --project $BOLTZ_DIR python "${DAP_DIR}/scripts/run_trunk_only.py" \
     $INPUT_YAML \
     --out_dir $RUN_B \
     --seed 42
@@ -68,7 +68,7 @@ echo "=============================================="
 echo "If these show ~0.000008 diff: CUDA non-determinism confirmed."
 echo "If these show 0.000000 diff: DAP has a real bug."
 echo ""
-uv run --project $BOLTZ_DIR python compare_checkpoints.py \
+uv run --project $BOLTZ_DIR python "${DAP_DIR}/scripts/compare_checkpoints.py" \
     $RUN_A/trunk_checkpoints.pt \
     $RUN_B/trunk_checkpoints.pt
 
@@ -77,7 +77,7 @@ echo "=============================================="
 echo "STEP 5: Compare with DAP run (from previous job)"
 echo "=============================================="
 echo "For reference: DAP vs baseline diffs"
-uv run --project $BOLTZ_DIR python compare_checkpoints.py \
+uv run --project $BOLTZ_DIR python "${DAP_DIR}/scripts/compare_checkpoints.py" \
     $RUN_A/trunk_checkpoints.pt \
     $OUT_BASE/dap_samedata_trunk_seed42/trunk_checkpoints.pt
 

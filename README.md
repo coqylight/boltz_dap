@@ -144,6 +144,9 @@ boltz_dap/
 │   ├── core.py                      # init_dap(), get_dap_rank(), get_dap_size()
 │   ├── comm.py                      # scatter, gather, row_to_col, col_to_row
 │   └── wrappers.py                  # Helper wrappers
+├── docs/                            # Getting started, prediction guide
+├── scripts/                         # Auxiliary Python scripts (compare, analyze, test, etc.)
+├── slurm/                           # SLURM job scripts (.sbatch, .sh) for HPC runs
 └── README.md
 ```
 
@@ -192,7 +195,3 @@ DAP produces results with minor floating-point differences from single-GPU Boltz
 ## License
 
 This DAP wrapper follows the same license as Boltz 2.
-
-## Further Advancements
-
-Please email gleeai@connect.ust.hk if there is anything to ask or in doubt or need help or offer me jobs💀💀💀. Happy to help!

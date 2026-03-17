@@ -130,7 +130,7 @@ echo "============================================================"
 echo "  Generating memory timeline plots"
 echo "============================================================"
 
-PLOT_SCRIPT="${DAP_DIR}/plot_memory.py"
+PLOT_SCRIPT="${DAP_DIR}/scripts/plot_memory.py"
 DAP_DIRS=()
 for entry in "${INPUTS[@]}"; do
     IFS='|' read -r INPUT LABEL DAP_GPUS <<< "$entry"

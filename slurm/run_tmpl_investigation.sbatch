@@ -43,7 +43,7 @@ echo "[STEP 1/4] Baseline trunk with template sub-op stats..."
 echo "============================================================"
 cd "$DAP_DIR"
 CUDA_VISIBLE_DEVICES=0 uv run --project "$BOLTZ_PROJECT" \
-    python run_trunk_only.py "$INPUT" \
+    python "${DAP_DIR}/scripts/run_trunk_only.py" "$INPUT" \
     --out_dir "$BASELINE_OUT" \
     --seed "$SEED" \
     --use_msa_server
@@ -75,7 +75,7 @@ echo "============================================================"
 echo "[STEP 3/4] Comparing checkpoints..."
 echo "============================================================"
 cd "$DAP_DIR"
-uv run --project "$BOLTZ_PROJECT" python compare_checkpoints.py \
+uv run --project "$BOLTZ_PROJECT" python "${DAP_DIR}/scripts/compare_checkpoints.py" \
     "$BASELINE_OUT/trunk_checkpoints.pt" \
     "$DAP_OUT/trunk_checkpoints.pt"
 
