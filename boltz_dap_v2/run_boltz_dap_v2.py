@@ -108,7 +108,10 @@ class GPUMonitor:
 @click.option("--use_flex_attention", is_flag=True, help="Use FlexAttention for triangle attention (memory/throughput)")
 @click.option("--use_flex_attention_chunked", is_flag=True, help="Use chunked FlexAttention for DAP (experimental; avoids 112GB OOM)")
 @click.option("--use_potentials", is_flag=True, help="Enable FK steering + physical guidance potentials")
+@click.option("--write_full_pae/--no_write_full_pae", default=True, help="Dump full PAE matrix to npz (default: on)")
+@click.option("--write_full_pde/--no_write_full_pde", default=True, help="Dump full PDE matrix to npz (default: on)")
 @click.option("--seed", type=int, default=None, help="Random seed for deterministic runs")
+@click.option("--skip_processing", is_flag=True, help="Reuse existing out_dir/processed without running process_inputs")
 def main(
     data: str,
     out_dir: str,
@@ -121,7 +124,10 @@ def main(
     use_flex_attention: bool = False,
     use_flex_attention_chunked: bool = False,
     use_potentials: bool = False,
+    write_full_pae: bool = False,
+    write_full_pde: bool = False,
     seed: int = None,
+    skip_processing: bool = False,
 ):
     """Run Boltz 2 with proper FastFold-style DAP (no model duplication)."""
 
@@ -203,19 +209,27 @@ def main(
     ccd_path = cache / "ccd.pkl"
     mol_dir = cache / "mols"
 
+    processed_manifest = out_dir / "processed" / "manifest.json"
     if dap_rank == 0:
-        process_inputs(
-            data=[data],
-            out_dir=out_dir,
-            ccd_path=ccd_path,
-            mol_dir=mol_dir,
-            use_msa_server=use_msa_server,
-            msa_server_url="https://api.colabfold.com",
-            msa_pairing_strategy="greedy",
-            boltz2=True,
-            preprocessing_threads=1,
-            max_msa_seqs=8192,
-        )
+        if skip_processing:
+            if not processed_manifest.exists():
+                raise FileNotFoundError(
+                    f"--skip_processing was set, but processed manifest was not found: {processed_manifest}"
+                )
+            rank_print("  ✓ Reusing existing processed inputs (skip_processing=True)")
+        else:
+            process_inputs(
+                data=[data],
+                out_dir=out_dir,
+                ccd_path=ccd_path,
+                mol_dir=mol_dir,
+                use_msa_server=use_msa_server,
+                msa_server_url="https://api.colabfold.com",
+                msa_pairing_strategy="greedy",
+                boltz2=True,
+                preprocessing_threads=1,
+                max_msa_seqs=8192,
+            )
 
     dist.barrier()
 
@@ -259,8 +273,8 @@ def main(
         "diffusion_samples": diffusion_samples,
         "max_parallel_samples": 1,
         "write_confidence_summary": True,
-        "write_full_pae": False,
-        "write_full_pde": False,
+        "write_full_pae": write_full_pae,
+        "write_full_pde": write_full_pde,
     }
 
     model = Boltz2.load_from_checkpoint(

@@ -102,11 +102,38 @@ torchrun --nproc_per_node=2 boltz_dap_v2/run_boltz_dap_v2.py \
 | `--use_flex_attention` | off | Use FlexAttention for triangle attention (memory/throughput; may need chunked on large N) |
 | `--use_flex_attention_chunked` | off | Chunked FlexAttention for DAP (avoids OOM on 25-sample hexamer; numerically matches original) |
 | `--use_potentials` | off | Enable FK steering + physical guidance potentials |
+| `--write_full_pae` | on | Write full PAE matrices to `.npz` files |
+| `--write_full_pde` | on | Write full PDE matrices to `.npz` files |
 | `--seed` | None | Random seed for reproducibility |
+| `--skip_processing` | off | Reuse an existing `out_dir/processed` directory |
 
-**Confidence** (pLDDT, pTM, iPTM, PAE, PDE) is always computed when the model supports it; no flag required.
+**Confidence** (pLDDT, pTM, iPTM, PAE, PDE) is always computed when the model supports it. In this DAP wrapper, full PAE/PDE dumps are enabled by default.
 
 For a full **prediction guide** (entrypoint, launch, input data, CLI options, pipeline stages), see [docs/boltz2_dap_prediction.md](docs/boltz2_dap_prediction.md).
+
+## Reproducibility
+
+For a **hexamer-focused reproduction workflow** with:
+
+- AF3-style defaults (`recycling_steps=10`, `sampling_steps=200`, `diffusion_samples=25`)
+- `--use_potentials`
+- full PAE/PDE export
+- automatic chain-pair `iPTM` / mean `PAE` / mean `iPDE` tables
+- automatic markdown summary report
+
+see [repro/README.md](repro/README.md).
+
+An example generated report is provided at [repro/example_report.md](repro/example_report.md).
+
+Example submission:
+
+```bash
+INPUT_YAML=/absolute/path/to/1LP3_hexamer_from_trimer_fill.yaml \
+BOLTZ_DIR=/absolute/path/to/boltz \
+sbatch repro/hexamer_repro.sbatch
+```
+
+`SEED` is intentionally optional. Set `SEED=42` only if you want stricter run-to-run reproducibility.
 
 ### SLURM Example
 
@@ -145,6 +172,7 @@ boltz_dap/
 │   ├── comm.py                      # scatter, gather, row_to_col, col_to_row
 │   └── wrappers.py                  # Helper wrappers
 ├── docs/                            # Getting started, prediction guide
+├── repro/                           # Hexamer reproduction workflow + report generator
 ├── scripts/                         # Auxiliary Python scripts (compare, analyze, test, etc.)
 ├── slurm/                           # SLURM job scripts (.sbatch, .sh) for HPC runs
 └── README.md
