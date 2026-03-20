@@ -215,9 +215,8 @@ This project was developed with generous compute support in HKUST HPC4 and Super
 
 We note the parallel development of [Fold-CP](https://github.com/NVIDIA-Digital-Bio/boltz-cp) by the team at NVIDIA Digital Bio, which also enables multi-GPU Boltz-2 inference (and also training) with a different approach. We look forward to comparing and learning from each other's implementations!
 
----
-
 ## Differences with [Fold-CP](https://github.com/NVIDIA-Digital-Bio/boltz-cp)
+
 Adapted from [boltz2_cp_prediction](https://github.com/NVIDIA-Digital-Bio/boltz-cp/blob/main/docs/boltz2_cp_prediction.md). Most of the original serial prediction's features are supported by Boltz-DAP.
 
 | Aspect                | Boltz-DAP (`torchrun boltz_dap_v2/run_boltz_dap_v2.py`)        | Fold-CP (`src/boltz/distributed/main.py`)                                          |
@@ -237,5 +236,3 @@ Adapted from [boltz2_cp_prediction](https://github.com/NVIDIA-Digital-Bio/boltz-
 | Constraint features   | **Supported**                                   | Not yet supported                                                                     |
 | Checkpoint loading    |                            | Reads checkpoint hparams, merges v2 flags, loads with `strict=True`                   |
 | Output writing        | All ranks write                             | Only CP rank 0 per DP group writes output                                             |
-
----
