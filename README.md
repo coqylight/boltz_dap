@@ -62,10 +62,10 @@ The full `z` is only materialized at scatter/gather boundaries. The entire trunk
 
 | Item | Used in development |
 |------|---------------------|
-| GPU | NVIDIA RTX 5880 Ada, H800 (2, 4, or 8 per node) |
+| GPU | NVIDIA RTX 5880 Ada (48 GB VRAM)\ H800 (80 GB VRAM) |
 | CUDA | Compatible with PyTorch 2.x |
 | GPU counts tested | 2, 4, 8 GPUs (e.g. trimer/hexamer on 4; 9MME N≈4642 on 8) |
-| Settings tested | **Boltz-2 default**: `recycling_steps=3`, `sampling_steps=200`, `diffusion_samples=1` · **AF3 default**: `recycling_steps=10`, `sampling_steps=200`, `diffusion_samples=25` |
+| Settings tested | **Boltz-2 default**: `recycling_steps=3`, `sampling_steps=200`, `diffusion_samples=1` \ **AF3 default**: `recycling_steps=10`, `sampling_steps=200`, `diffusion_samples=25` |
 | Workloads | AAV2 VP3 Trimer (e.g. 3×519 aa), AAV2 VP3 Hexamer (6×~519 aa, 25 samples with `--use_flex_attention_chunked`), 9MME (N≈4642, 8 GPUs) |
 
 Other GPU models (A100, V100, etc.) should work with 2+ GPUs; memory per GPU scales with shard size.
