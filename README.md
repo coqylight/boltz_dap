@@ -219,11 +219,11 @@ We note the parallel development of [Fold-CP](https://github.com/NVIDIA-Digital-
 
 Adapted from [boltz2_cp_prediction](https://github.com/NVIDIA-Digital-Bio/boltz-cp/blob/main/docs/boltz2_cp_prediction.md). Most of the original serial prediction's features are supported by Boltz-DAP.
 
-| Aspect                | Boltz-DAP (`torchrun boltz_dap_v2/run_boltz_dap_v2.py`)        | Fold-CP (`src/boltz/distributed/main.py`)                                          |
+| Aspect                | Boltz-DAP (`boltz_dap_v2/run_boltz_dap_v2.py`)        | Fold-CP (`src/boltz/distributed/main.py`)                                          |
 | --------------------- | ------------------------------------------- | ------------------------------------------------------------------------------------- |
 | Multi-GPU strategy    |                | `SingleDeviceStrategy` + DTensor CP mesh                                              |
 | Device management     |       | `DistributedManager` via `--size_dp`, `--size_cp`                                     |
-| Launch method         |           | `torchrun` or `srun`                                                                  |
+| Launch method         | `torchrun` or `srun`          | `torchrun` or `srun`                                                                  |
 | Input formats         | `config_files` (YAML/FASTA), `preprocessed` | `preprocessed` only                                                                   |
 | `num_workers`         | Configurable                                | Fixed at `0` (DTensor CP requires main-process collation)                             |
 | Precision             | Lightning `--precision` string              | Top-level `--precision` enum                                                          |
