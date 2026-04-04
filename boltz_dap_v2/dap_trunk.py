@@ -250,7 +250,23 @@ def _zs_checkpoint(label, z_scattered, s, original_N):
     
     z_scattered is [B, N/dap, N_padded, D]. We gather to full z.
     Returns dict with full tensors (bf16, CPU) for exact comparison.
+    
+    When BOLTZ_SAVE_TRUNK_CKPT=0 (see run_boltz_dap_v2 --no_save_trunk_checkpoints),
+    skips the gather and CPU copy entirely. Otherwise every checkpoint would call
+    ``gather`` and allocate a full N×N×D pair tensor on GPU — tens of GB for large
+    complexes and the dominant OOM seen on 15-mer scale jobs.
     """
+    if os.environ.get("BOLTZ_SAVE_TRUNK_CKPT", "1") != "1":
+        dap_rank = get_dap_rank()
+        if dap_rank == 0:
+            print(
+                f"    [CKP] [{label}]  (skipped full gather — BOLTZ_SAVE_TRUNK_CKPT=0)"
+            )
+        return {
+            "z": torch.zeros(1, dtype=torch.bfloat16, device="cpu"),
+            "s": torch.zeros(1, dtype=torch.bfloat16, device="cpu"),
+        }
+
     dap_rank = get_dap_rank()
     dap_size = get_dap_size()
     

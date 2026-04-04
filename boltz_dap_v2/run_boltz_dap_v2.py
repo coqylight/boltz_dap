@@ -113,7 +113,12 @@ class GPUMonitor:
 @click.option(
     "--save_trunk_checkpoints/--no_save_trunk_checkpoints",
     default=True,
-    help="Save large trunk_checkpoints.pt debug artifact (default: on)",
+    help=(
+        "Save trunk_checkpoints.pt and run full GPU gather for each trunk debug "
+        "snapshot (default: on). Use --no_save_trunk_checkpoints for production "
+        "or very large N: disables disk artifact and skips per-step gather (avoids "
+        "OOM from materializing full z on one GPU)."
+    ),
 )
 @click.option(
     "--save_granular_checkpoints/--no_save_granular_checkpoints",
