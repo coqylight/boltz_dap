@@ -36,6 +36,142 @@ from dap_pairformer_noseq import DAPPairformerNoSeqLayer
 from dap_confidence import inject_dap_into_confidence, run_confidence_dap
 
 
+def _run_atom_encoder_with_chunked_zcond(ae, feats, s_trunk, z_cond, chunk_rows: int):
+    """Run :class:`AtomEncoder` forward with chunked ``z_to_p`` from ``z_cond``.
+
+    Mirrors ``boltz.model.modules.encodersv2.AtomEncoder.forward`` for
+    ``structure_prediction=True``, but the ``z_to_p_trans(z)`` + einsum block is
+    fused into a loop over token rows so we never materialize a full
+    ``[B, Nt, Nt, D]`` ``z_to_p`` tensor on GPU.
+
+    Parameters
+    ----------
+    z_cond
+        Pairwise conditioning ``[B, Nt, Nt, tz]`` on CUDA (same ``B``/``Nt`` as trunk).
+    chunk_rows
+        Token row chunk size; reuse ``BOLTZ_DC_ATOM_ENCODER_CHUNK`` in the caller.
+    """
+    from functools import partial
+
+    from torch.nn.functional import one_hot
+
+    from boltz.model.modules.encodersv2 import get_indexing_matrix, single_to_keys
+
+    with torch.autocast("cuda", enabled=False):
+        B, N, _ = feats["ref_pos"].shape
+        atom_mask = feats["atom_pad_mask"].bool()
+
+        atom_ref_pos = feats["ref_pos"]
+        atom_uid = feats["ref_space_uid"]
+
+        atom_feats = [
+            atom_ref_pos,
+            feats["ref_charge"].unsqueeze(-1),
+            feats["ref_element"],
+        ]
+        if not ae.use_no_atom_char:
+            atom_feats.append(feats["ref_atom_name_chars"].reshape(B, N, 4 * 64))
+        if ae.use_atom_backbone_feat:
+            atom_feats.append(feats["atom_backbone_feat"])
+        if ae.use_residue_feats_atoms:
+            res_feats = torch.cat(
+                [
+                    feats["res_type"],
+                    feats["modified"].unsqueeze(-1),
+                    one_hot(feats["mol_type"], num_classes=4).float(),
+                ],
+                dim=-1,
+            )
+            atom_to_token = feats["atom_to_token"].float()
+            atom_res_feats = torch.bmm(atom_to_token, res_feats)
+            atom_feats.append(atom_res_feats)
+
+        atom_feats = torch.cat(atom_feats, dim=-1)
+
+        c = ae.embed_atom_features(atom_feats)
+
+        W, H = ae.atoms_per_window_queries, ae.atoms_per_window_keys
+        B, N = c.shape[:2]
+        K = N // W
+        keys_indexing_matrix = get_indexing_matrix(K, W, H, c.device)
+        to_keys = partial(
+            single_to_keys, indexing_matrix=keys_indexing_matrix, W=W, H=H
+        )
+
+        atom_ref_pos_queries = atom_ref_pos.view(B, K, W, 1, 3)
+        atom_ref_pos_keys = to_keys(atom_ref_pos).view(B, K, 1, H, 3)
+
+        d = atom_ref_pos_keys - atom_ref_pos_queries
+        d_norm = torch.sum(d * d, dim=-1, keepdim=True)
+        d_norm = 1 / (1 + d_norm)
+
+        atom_mask_queries = atom_mask.view(B, K, W, 1)
+        atom_mask_keys = (
+            to_keys(atom_mask.unsqueeze(-1).float()).view(B, K, 1, H).bool()
+        )
+        atom_uid_queries = atom_uid.view(B, K, W, 1)
+        atom_uid_keys = (
+            to_keys(atom_uid.unsqueeze(-1).float()).view(B, K, 1, H).long()
+        )
+        v = (
+            (
+                atom_mask_queries
+                & atom_mask_keys
+                & (atom_uid_queries == atom_uid_keys)
+            )
+            .float()
+            .unsqueeze(-1)
+        )
+
+        p = ae.embed_atompair_ref_pos(d) * v
+        p = p + ae.embed_atompair_ref_dist(d_norm) * v
+        p = p + ae.embed_atompair_mask(v) * v
+
+        q = c
+
+        if ae.structure_prediction:
+            atom_to_token = feats["atom_to_token"].float()
+
+            s_to_c = ae.s_to_c_trans(s_trunk.float())
+            s_to_c = torch.bmm(atom_to_token, s_to_c)
+            c = c + s_to_c.to(c)
+
+            atom_to_token_queries = atom_to_token.view(
+                B, K, W, atom_to_token.shape[-1]
+            )
+            atom_to_token_keys = to_keys(atom_to_token)
+
+            Nt = z_cond.shape[1]
+            p_z_acc = torch.zeros(
+                (B, K, W, H, p.shape[-1]),
+                device=p.device,
+                dtype=torch.float32,
+            )
+            ztp = ae.z_to_p_trans
+            cr = max(1, int(chunk_rows))
+            for i0 in range(0, Nt, cr):
+                i1 = min(i0 + cr, Nt)
+                z_chunk = z_cond[:, i0:i1]
+                z_row = ztp(z_chunk.float())
+                Qc = atom_to_token_queries[:, :, :, i0:i1]
+                p_z_acc.add_(
+                    torch.einsum(
+                        "bijd,bwki,bwlj->bwkld",
+                        z_row,
+                        Qc,
+                        atom_to_token_keys,
+                    )
+                )
+                del z_row, z_chunk
+            p = p + p_z_acc.to(dtype=p.dtype)
+
+        p = p + ae.c_to_p_trans_q(c.view(B, K, W, 1, c.shape[-1]))
+        p = p + ae.c_to_p_trans_k(to_keys(c).view(B, K, 1, H, c.shape[-1]))
+        p = p + ae.p_mlp(p)
+
+    return q, c, p, to_keys
+
+
 def inject_dap_into_model(model):
     """Inject DAP wrappers into a Boltz 2 model in-place.
 
@@ -452,6 +588,7 @@ def _make_dap_forward(model):
                         if hasattr(msa, '_orig_mod') and not model.training:
                             msa = msa._orig_mod
 
+                        _save_gran_ckpt = os.environ.get("BOLTZ_SAVE_GRAN_CKPT", "1") == "1"
                         z_before_msa = z_scattered
                         z_msa_out = _run_msa_dap(
                             msa, z_scattered, s_inputs, feats,
@@ -462,7 +599,7 @@ def _make_dap_forward(model):
 
                         # Save msa/z_out_residual granular checkpoint
                         # ALL ranks must participate in gather (collective op)
-                        if i == 0:
+                        if i == 0 and _save_gran_ckpt:
                             _z_msa_full = gather(z_msa_out.contiguous(), dim=1, original_size=N_padded)
                             if dap_rank == 0:
                                 _msa_gran = getattr(_run_msa_dap, '_gran_ckpts', {})
@@ -478,7 +615,7 @@ def _make_dap_forward(model):
                         _checkpoints[f"R{i}/after_msa"] = cp
 
                         # Merge MSA granular checkpoints into granular_ckpts.pt
-                        if i == 0 and dap_rank == 0 and hasattr(_run_msa_dap, '_gran_ckpts') and _run_msa_dap._gran_ckpts:
+                        if i == 0 and _save_gran_ckpt and dap_rank == 0 and hasattr(_run_msa_dap, '_gran_ckpts') and _run_msa_dap._gran_ckpts:
                             import os as _os
                             _out_dir = _os.environ.get('BOLTZ_OUT_DIR', '')
                             if _out_dir:
@@ -544,8 +681,10 @@ def _make_dap_forward(model):
                     z = None
                     torch.cuda.empty_cache()
 
-                # Save checkpoints (rank 0 only)
-                if dap_rank == 0:
+                # Save checkpoints only when explicitly enabled; these artifacts are
+                # very large and not needed for normal inference runs.
+                _save_trunk_ckpt = os.environ.get("BOLTZ_SAVE_TRUNK_CKPT", "1") == "1"
+                if dap_rank == 0 and _save_trunk_ckpt:
                     import os as _os
                     _out_dir = _os.environ.get('BOLTZ_OUT_DIR', '')
                     if _out_dir:
@@ -590,7 +729,7 @@ def _make_dap_forward(model):
                     _mem_log("  dc: before pairwise_conditioner")
                     pw = dc.pairwise_conditioner
                     N = z_cpu.shape[1]
-                    chunk_size = 512  # Process 512 rows at a time
+                    chunk_size = int(os.environ.get("BOLTZ_DC_PAIRWISE_CHUNK", "512"))
 
                     # Allocate output z_cond on GPU
                     # Determine output dim by probing with a small tensor
@@ -638,23 +777,34 @@ def _make_dap_forward(model):
                     del _p_in, _p_out
                     total_bias_dim = n_layers * per_layer_dim
 
-                    token_trans_bias = torch.empty(1, N, N, total_bias_dim, dtype=z_cond.dtype, device="cuda")
-                    chunk_size_ttb = 256  # Smaller chunks for 24 projections
+                    # Stream rows to CPU — avoids a full [1,N,N,total_bias_dim] GPU alloc
+                    # (that tensor dominated peak VRAM with large N).
+                    _pin = bool(torch.cuda.is_available())
+                    token_trans_bias_cpu = torch.empty(
+                        1,
+                        N,
+                        N,
+                        total_bias_dim,
+                        dtype=z_cond.dtype,
+                        device="cpu",
+                        pin_memory=_pin,
+                    )
+                    chunk_size_ttb = int(os.environ.get("BOLTZ_DC_TOKEN_BIAS_CHUNK", "256"))
                     for row_start in range(0, N, chunk_size_ttb):
                         row_end = min(row_start + chunk_size_ttb, N)
-                        z_chunk = z_cond[:, row_start:row_end]  # [1, chunk, N, 128]
-                        token_trans_bias[:, row_start:row_end] = torch.cat(
+                        z_chunk = z_cond[:, row_start:row_end]
+                        bias_gpu = torch.cat(
                             [layer(z_chunk) for layer in layers], dim=-1
                         )
-                        del z_chunk
-                    _mem_log("  dc: after token_trans_bias (row-chunked)")
+                        token_trans_bias_cpu[:, row_start:row_end].copy_(
+                            bias_gpu, non_blocking=_pin
+                        )
+                        del bias_gpu, z_chunk
+                    _mem_log("  dc: after token_trans_bias (row-chunked, streamed to CPU)")
 
                     # Offload token_trans_proj_z weights
                     for layer in dc.token_trans_proj_z:
                         layer.cpu()
-                    # Offload token_trans_bias to CPU before atom_encoder (~8.2GB freed)
-                    token_trans_bias_cpu = token_trans_bias.cpu()
-                    del token_trans_bias
                     # Offload structure_module + confidence weights (not needed until later)
                     # These are still on GPU from model init, taking ~10-15GB
                     if hasattr(model, 'structure_module'):
@@ -669,56 +819,14 @@ def _make_dap_forward(model):
                     torch.cuda.empty_cache()
                     _mem_log("  dc: struct/conf/bias all offloaded before atom_enc")
 
-                    # ③ AtomEncoder — pre-compute z_to_p in row-chunks to avoid
-                    # materializing full z.float() (11GB for N=4642)
-                    _mem_log("  dc: before atom_encoder (chunked z_to_p)")
-                    
+                    # ③ AtomEncoder — chunked z_to_p fused with einsum (no full N×N z_to_p on GPU)
+                    _mem_log("  dc: before atom_encoder (chunked z_to_p + einsum)")
                     ae = dc.atom_encoder
-                    z_to_p_trans = ae.z_to_p_trans
-                    
-                    # Probe output dim of z_to_p_trans
-                    _probe = torch.zeros(1, 1, 1, z_cond.shape[-1], dtype=torch.float32, device="cuda")
-                    z_to_p_dim = z_to_p_trans(_probe).shape[-1]
-                    del _probe
-                    
-                    # Pre-compute z_to_p in row-chunks
-                    z_to_p_full = torch.empty(1, N, N, z_to_p_dim, dtype=torch.float32, device="cuda")
-                    chunk_ae = 256
-                    for row_start in range(0, N, chunk_ae):
-                        row_end = min(row_start + chunk_ae, N)
-                        z_chunk = z_cond[:, row_start:row_end].float()  # [1, chunk, N, 128] fp32
-                        z_to_p_full[:, row_start:row_end] = z_to_p_trans(z_chunk)
-                        del z_chunk
-                    _mem_log("  dc: z_to_p pre-computed (row-chunked)")
-                    
-                    # Free z_cond — no longer needed (z_to_p already computed)
-                    del z_cond
-                    torch.cuda.empty_cache()
-                    _mem_log("  dc: z_cond freed before atom_enc forward")
-                    
-                    # Monkey-patch z_to_p_trans to return pre-computed result
-                    # nn.Module.__setattr__ rejects non-Module, so wrap in a Module
-                    class _PrecomputedZToP(torch.nn.Module):
-                        def __init__(self, result):
-                            super().__init__()
-                            self._result = result
-                        def forward(self, x):
-                            return self._result
-                    
-                    original_z_to_p_trans = ae.z_to_p_trans
-                    ae.z_to_p_trans = _PrecomputedZToP(z_to_p_full)
-                    
-                    # Create a dummy z — z_to_p_trans is monkey-patched so z.float()
-                    # result is discarded. Just needs valid shape for other parts of forward.
-                    dummy_z = torch.zeros(1, N, N, 1, dtype=torch.float32, device="cuda")
-                    
-                    q, c, p, to_keys = ae(
-                        feats=feats, s_trunk=s, z=dummy_z,
+                    chunk_ae = max(1, int(os.environ.get("BOLTZ_DC_ATOM_ENCODER_CHUNK", "256")))
+                    q, c, p, to_keys = _run_atom_encoder_with_chunked_zcond(
+                        ae, feats, s, z_cond, chunk_ae
                     )
-                    
-                    # Restore original z_to_p_trans
-                    ae.z_to_p_trans = original_z_to_p_trans
-                    del z_to_p_full, dummy_z
+                    del z_cond
                     torch.cuda.empty_cache()
                     _mem_log("  dc: after atom_encoder")
 
@@ -1079,7 +1187,8 @@ def _run_template_dap(tmpl_module, z_scattered, feats, pair_mask, use_kernels, o
 
     dap_size = get_dap_size()
     dap_rank = get_dap_rank()
-    _tmpl_debug = os.environ.get("BOLTZ_TEMPLATE_DEBUG", "0") == "1"
+    _save_gran_ckpt = os.environ.get("BOLTZ_SAVE_GRAN_CKPT", "1") == "1"
+    _tmpl_debug = os.environ.get("BOLTZ_TEMPLATE_DEBUG", "0") == "1" and _save_gran_ckpt
 
     # Granular checkpoint dict (R0 only, rank 0 only, debug only)
     _gran_ckpts = {} if _tmpl_debug else None
@@ -1517,7 +1626,9 @@ def _run_msa_dap(msa_module, z_scattered, s_inputs, feats, full_pair_mask, use_k
         layer._diag_enabled = _msa_diag and (i <= 1)
 
         # Enable granular checkpoints on block 0 when diagnostics are active
-        if _msa_diag and i == 0:
+        _save_gran_ckpt = os.environ.get("BOLTZ_SAVE_GRAN_CKPT", "1") == "1"
+
+        if _msa_diag and _save_gran_ckpt and i == 0:
             layer._save_gran_ckpts = True
             layer._gran_ckpt_data = {}
 
@@ -1535,7 +1646,7 @@ def _run_msa_dap(msa_module, z_scattered, s_inputs, feats, full_pair_mask, use_k
         # NOTE: _gran_ckpt_data is only populated on rank 0, so we must reset
         # _save_gran_ckpts unconditionally to prevent rank 1 from doing extra
         # gathers in subsequent recycles.
-        if _msa_diag and i == 0:
+        if _msa_diag and _save_gran_ckpt and i == 0:
             _dap_rank = get_dap_rank()
             if _dap_rank == 0 and hasattr(layer, '_gran_ckpt_data') and layer._gran_ckpt_data:
                 _gran_ckpts = getattr(_run_msa_dap, '_gran_ckpts', {})

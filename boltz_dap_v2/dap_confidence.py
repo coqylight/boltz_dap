@@ -673,13 +673,56 @@ def run_confidence_dap(
     del d_chunk
 
     # 3b. Chunked PDE on Rank 0 (never gather full z — avoids OOM on hexamer)
-    # For each row chunk: R0 receives that row chunk + gathers column chunk from all ranks, computes z_sym and PDE.
+    # For each column block r_start:r_end_col: R0 gathers rows + z_sym, runs PDE heads.
+    # Optional: BOLTZ_DAP_KEEP_PDE_LOGITS=1 (--keep_pde_logits) keeps full logits on CPU; default off (saves RAM).
+    keep_pde_logits = os.environ.get("BOLTZ_DAP_KEEP_PDE_LOGITS", "0") == "1"
     D_z_chunk = z_chunk.shape[3]
     if dap_rank == 0 and heads.use_separate_heads:
         asym_id_token = feats["asym_id"]
         is_same_chain = (asym_id_token.unsqueeze(-1) == asym_id_token.unsqueeze(-2)).float()
         is_different_chain = 1.0 - is_same_chain
-    pde_list = []
+
+    token_pair_mask: Optional[Tensor] = None
+    token_interface_pair_mask: Optional[Tensor] = None
+    numer_pde = denom_pde = numer_ipde = denom_ipde = None
+    pde_full_cpu: Optional[Tensor] = None
+    pde_logits_cpu_chunks: Optional[list] = None
+    _pde_stream_pin = False
+    if dap_rank == 0:
+        from boltz.model.layers.confidence_utils import compute_aggregated_metric as _pde_expectation
+
+        pred_distogram_prob = torch.nn.functional.softmax(
+            pred_distogram_logits, dim=-1
+        ).repeat_interleave(multiplicity, 0)
+        contacts = torch.zeros(
+            (1, 1, 1, 64), dtype=pred_distogram_prob.dtype, device=pred_distogram_prob.device
+        )
+        contacts[:, :, :, :20] = 1.0
+        prob_contact = (pred_distogram_prob * contacts).sum(-1)
+        token_pad_mask_m = feats["token_pad_mask"].repeat_interleave(multiplicity, 0)
+        token_pad_pair_mask = (
+            token_pad_mask_m.unsqueeze(-1)
+            * token_pad_mask_m.unsqueeze(-2)
+            * (
+                1
+                - torch.eye(
+                    token_pad_mask_m.shape[1], device=token_pad_mask_m.device
+                ).unsqueeze(0)
+            )
+        )
+        token_pair_mask = token_pad_pair_mask * prob_contact
+        asym_id_rep = feats["asym_id"].repeat_interleave(multiplicity, 0)
+        token_interface_pair_mask = token_pair_mask * (
+            asym_id_rep.unsqueeze(-1) != asym_id_rep.unsqueeze(-2)
+        )
+        numer_pde = torch.zeros(B, device=pred_distogram_logits.device, dtype=torch.float32)
+        denom_pde = torch.zeros(B, device=pred_distogram_logits.device, dtype=torch.float32)
+        numer_ipde = torch.zeros(B, device=pred_distogram_logits.device, dtype=torch.float32)
+        denom_ipde = torch.zeros(B, device=pred_distogram_logits.device, dtype=torch.float32)
+        _pde_stream_pin = bool(torch.cuda.is_available())
+        pde_full_cpu = torch.empty((B, N, N), dtype=torch.float32, device="cpu", pin_memory=_pde_stream_pin)
+        pde_logits_cpu_chunks = [] if keep_pde_logits else None
+
     for r_idx in range(dap_size):
         _cmem(f"chunked PDE r_idx={r_idx}/{dap_size} start")
         r_start = r_idx * chunk_N
@@ -737,33 +780,63 @@ def run_confidence_dap(
             else:
                 pde_c = heads.to_pde_logits(z_sym_chunk)
             del z_sym_chunk
-            pde_list.append(pde_c)
+            # On-the-fly: expected PDE scalar field + gPDE/giPDE (same formulas as confidencev2) without
+            # full [B,N,N,bins] pde_logits on GPU; optional CPU chunks for logits if KEEP flag set.
+            # Layout: pde_c is [B, j_block, i, bins]; torch.cat(..., dim=1) stacks j → equivalent to
+            # pde_logits[b, j, i, :]. token_pair_mask is [b, i, j] so use pde_ij = pde_cm.permute(0,2,1).
+            pde_cm = _pde_expectation(pde_c, end=32)
+            pde_ij = pde_cm.float().permute(0, 2, 1)
+            m_blk = token_pair_mask[:, :, r_start:r_end_col].float()
+            iface_blk = token_interface_pair_mask[:, :, r_start:r_end_col].float()
+            numer_pde += (pde_ij * m_blk).sum(dim=(1, 2))
+            denom_pde += m_blk.sum(dim=(1, 2))
+            numer_ipde += (pde_ij * iface_blk).sum(dim=(1, 2))
+            denom_ipde += iface_blk.sum(dim=(1, 2))
+            pde_full_cpu[:, :, r_start:r_end_col].copy_(pde_ij.cpu(), non_blocking=_pde_stream_pin)
+            if pde_logits_cpu_chunks is not None:
+                pde_logits_cpu_chunks.append(pde_c.detach().cpu())
+            del pde_c, pde_cm, pde_ij, m_blk, iface_blk
         _cmem(f"chunked PDE r_idx={r_idx}/{dap_size} done")
     del z_chunk
+    pde_logits: Optional[Tensor] = None
+    complex_pde: Optional[Tensor] = None
+    complex_ipde: Optional[Tensor] = None
+    pde: Optional[Tensor] = None
     if dap_rank == 0:
-        pde_logits = torch.cat(pde_list, dim=1)
-        del pde_list
-        if N_padded != N:
-            pde_logits = pde_logits[:, :N, :N, :].contiguous()
+        complex_pde = numer_pde / denom_pde
+        complex_ipde = numer_ipde / (denom_ipde + 1e-5)
+        pde = pde_full_cpu
+        if keep_pde_logits and pde_logits_cpu_chunks:
+            pde_logits = torch.cat(pde_logits_cpu_chunks, dim=1)
+            del pde_logits_cpu_chunks
+            if N_padded != N:
+                pde_logits = pde_logits[:, :N, :N, :].contiguous()
+        # Masks / distogram prob only used inside chunked PDE; drop before 3c to free GB-scale GPU.
+        del pred_distogram_prob, prob_contact, token_pad_pair_mask, contacts
+        del token_pair_mask, token_interface_pair_mask, asym_id_rep
     torch.distributed.barrier()
     _cmem("chunked PDE done")
 
     # 3c. GPU 0: run metrics (no full z)
     if dap_rank == 0:
+        torch.cuda.empty_cache()
         out_dict = {}
 
         if conf.return_latent_feats:
             out_dict["s_conf"] = s
             out_dict["z_conf"] = None  # not kept to save memory
 
-        # Apply intra/inter masks for separate heads PAE
+        # Apply intra/inter masks for separate heads PAE (in-place: avoid intra+inter+out triple peak)
         if heads.use_separate_heads:
             asym_id_token = feats["asym_id"]
             is_same_chain = asym_id_token.unsqueeze(-1) == asym_id_token.unsqueeze(-2)
             is_different_chain = ~is_same_chain
-            pae_logits = (pae_intra_logits * is_same_chain.float().unsqueeze(-1)
-                         + pae_inter_logits * is_different_chain.float().unsqueeze(-1))
-            del pae_intra_logits, pae_inter_logits
+            m_same = is_same_chain.float().unsqueeze(-1)
+            m_diff = is_different_chain.float().unsqueeze(-1)
+            pae_intra_logits.mul_(m_same)
+            pae_intra_logits.addcmul_(pae_inter_logits, m_diff)
+            del pae_inter_logits
+            pae_logits = pae_intra_logits
 
         _cmem("PDE done")
 
@@ -845,26 +918,7 @@ def run_confidence_dap(
                 feats["atom_pad_mask"] * iplddt_weight, dim=-1
             )
 
-        # gPDE and giPDE
-        pde = compute_aggregated_metric(pde_logits, end=32)
-        pred_distogram_prob = torch.nn.functional.softmax(
-            pred_distogram_logits, dim=-1
-        ).repeat_interleave(multiplicity, 0)
-        contacts = torch.zeros((1, 1, 1, 64), dtype=pred_distogram_prob.dtype).to(pred_distogram_prob.device)
-        contacts[:, :, :, :20] = 1.0
-        prob_contact = (pred_distogram_prob * contacts).sum(-1)
-        token_pad_mask = feats["token_pad_mask"].repeat_interleave(multiplicity, 0)
-        token_pad_pair_mask = (
-            token_pad_mask.unsqueeze(-1) * token_pad_mask.unsqueeze(-2)
-            * (1 - torch.eye(token_pad_mask.shape[1], device=token_pad_mask.device).unsqueeze(0))
-        )
-        token_pair_mask = token_pad_pair_mask * prob_contact
-        complex_pde = (pde * token_pair_mask).sum(dim=(1, 2)) / token_pair_mask.sum(dim=(1, 2))
-        asym_id = feats["asym_id"].repeat_interleave(multiplicity, 0)
-        token_interface_pair_mask = token_pair_mask * (asym_id.unsqueeze(-1) != asym_id.unsqueeze(-2))
-        complex_ipde = (pde * token_interface_pair_mask).sum(dim=(1, 2)) / (
-            token_interface_pair_mask.sum(dim=(1, 2)) + 1e-5
-        )
+        # gPDE / giPDE / pde field: already computed during chunked PDE (same formulas as confidencev2).
 
         out_dict.update(dict(
             pde_logits=pde_logits,

@@ -110,6 +110,24 @@ class GPUMonitor:
 @click.option("--use_potentials", is_flag=True, help="Enable FK steering + physical guidance potentials")
 @click.option("--write_full_pae/--no_write_full_pae", default=True, help="Dump full PAE matrix to npz (default: on)")
 @click.option("--write_full_pde/--no_write_full_pde", default=True, help="Dump full PDE matrix to npz (default: on)")
+@click.option(
+    "--save_trunk_checkpoints/--no_save_trunk_checkpoints",
+    default=True,
+    help="Save large trunk_checkpoints.pt debug artifact (default: on)",
+)
+@click.option(
+    "--save_granular_checkpoints/--no_save_granular_checkpoints",
+    default=True,
+    help="Save granular_ckpts.pt debug artifact (default: on)",
+)
+@click.option("--dc_pairwise_chunk_size", type=int, default=512, help="Row chunk size for diffusion pairwise conditioner")
+@click.option("--dc_token_bias_chunk_size", type=int, default=256, help="Row chunk size for diffusion token_trans_bias")
+@click.option("--dc_atom_encoder_chunk_size", type=int, default=256, help="Row chunk size for diffusion atom encoder z_to_p")
+@click.option(
+    "--keep_pde_logits",
+    is_flag=True,
+    help="After chunked PDE, also concatenate full pde_logits on CPU (~large). Default off to save memory; pde field is always built.",
+)
 @click.option("--seed", type=int, default=None, help="Random seed for deterministic runs")
 @click.option("--skip_processing", is_flag=True, help="Reuse existing out_dir/processed without running process_inputs")
 def main(
@@ -126,6 +144,12 @@ def main(
     use_potentials: bool = False,
     write_full_pae: bool = False,
     write_full_pde: bool = False,
+    save_trunk_checkpoints: bool = True,
+    save_granular_checkpoints: bool = True,
+    dc_pairwise_chunk_size: int = 512,
+    dc_token_bias_chunk_size: int = 256,
+    dc_atom_encoder_chunk_size: int = 256,
+    keep_pde_logits: bool = False,
     seed: int = None,
     skip_processing: bool = False,
 ):
@@ -163,6 +187,12 @@ def main(
     out_dir.mkdir(parents=True, exist_ok=True)
     import os as _os
     _os.environ['BOLTZ_OUT_DIR'] = str(out_dir)
+    _os.environ['BOLTZ_SAVE_TRUNK_CKPT'] = "1" if save_trunk_checkpoints else "0"
+    _os.environ['BOLTZ_SAVE_GRAN_CKPT'] = "1" if save_granular_checkpoints else "0"
+    _os.environ['BOLTZ_DC_PAIRWISE_CHUNK'] = str(dc_pairwise_chunk_size)
+    _os.environ['BOLTZ_DC_TOKEN_BIAS_CHUNK'] = str(dc_token_bias_chunk_size)
+    _os.environ['BOLTZ_DC_ATOM_ENCODER_CHUNK'] = str(dc_atom_encoder_chunk_size)
+    _os.environ['BOLTZ_DAP_KEEP_PDE_LOGITS'] = "1" if keep_pde_logits else "0"
     log_file = out_dir / "gpu_memory.log"
 
     def rank_print(msg):
@@ -175,6 +205,14 @@ def main(
     rank_print(f"Input: {data}")
     rank_print(f"Output: {out_dir}")
     rank_print(f"No model duplication — activations sharded across GPUs")
+    rank_print(
+        "Trunk checkpoints: "
+        + ("on" if save_trunk_checkpoints else "off")
+        + " | granular checkpoints: "
+        + ("on" if save_granular_checkpoints else "off")
+        + f" | diffusion chunks: pw={dc_pairwise_chunk_size},"
+        + f" ttb={dc_token_bias_chunk_size}, ae={dc_atom_encoder_chunk_size}"
+    )
     rank_print(f"{'='*70}\n")
 
     # Start GPU monitoring (rank 0 only)

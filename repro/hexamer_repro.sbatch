@@ -33,7 +33,7 @@ SEED="${SEED:-}"
 DAP_SCRIPT="$REPO_DIR/boltz_dap_v2/run_boltz_dap_v2.py"
 CHAIN_SCRIPT="$REPO_DIR/scripts/summarize_chain_pair_metrics.py"
 REPORT_SCRIPT="$REPO_DIR/repro/collect_hexamer_repro_report.py"
-VENV_ACTIVATE="$BOLTZ_DIR/.venv/bin/activate"
+VENV_ACTIVATE="$BOLTZ_DIR/.venv_orig/bin/activate"
 
 source "$VENV_ACTIVATE"
 mkdir -p "$OUT_DIR"
