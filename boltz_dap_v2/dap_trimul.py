@@ -13,6 +13,11 @@ Key pattern:
 - TriMulIn: z is col-scattered [B, N, N/dap, D]
   • broadcast a from each rank → compute partial einsum for that i-range
   • output is col-scattered [B, N, N/dap, D]
+
+Optional second-axis micro-chunking (same math as one einsum; lowers peak VRAM):
+  BOLTZ_TRIMUL_MICRO_J — max j-width per einsum inside each rank block (TriMulOut)
+  BOLTZ_TRIMUL_MICRO_I — max i-height per einsum inside each rank block (TriMulIn)
+  Unset → min(span, 128). Set to a large value to effectively disable.
 """
 
 import torch
@@ -42,6 +47,20 @@ def _log(prefix, tag, a0=None):
     delta = f"Δ{a - a0:+.0f}" if a0 is not None else ""
     print(f"          [{prefix}] {tag:40s} | alloc={a:8.0f}MB | peak={p:8.0f}MB | {delta}", flush=True)
     return a
+
+
+def _micro_chunk_size(axis: str, span: int) -> int:
+    """Sub-chunk length along j (out) or i (in) within one DAP rank block [1, span].
+
+    axis: 'j' for TriangleMultiplicationOutgoing, 'i' for Incoming.
+    """
+    if span <= 0:
+        return 1
+    key = f"BOLTZ_TRIMUL_MICRO_{axis.upper()}"
+    raw = os.environ.get(key)
+    if raw is not None and str(raw).strip() != "":
+        return max(1, min(span, int(raw)))
+    return max(1, min(span, 128))
 
 
 class DAPTriMulOut(nn.Module):
@@ -99,10 +118,17 @@ class DAPTriMulOut(nn.Module):
 
             j_start = src * N_local
             j_end = min(j_start + N_local, N_full)
-            out[:, :, j_start:j_end, :] = torch.einsum(
-                "bikd,bjkd->bijd", a, b_chunk[:, :j_end - j_start, :, :]
-            )
-            a0 = _log(P, f"einsum src={src} j=[{j_start}:{j_end}]", a0)
+            j_span = j_end - j_start
+            micro_j = _micro_chunk_size("j", j_span)
+            for jj in range(j_start, j_end, micro_j):
+                jj_e = min(jj + micro_j, j_end)
+                r0 = jj - j_start
+                r1 = jj_e - j_start
+                b_sub = b_chunk[:, r0:r1, :, :]
+                out[:, :, jj:jj_e, :] = torch.einsum(
+                    "bikd,bjkd->bijd", a, b_sub
+                )
+            a0 = _log(P, f"einsum src={src} j=[{j_start}:{j_end}] micro={micro_j}", a0)
 
         del a, b, b_contig, b_recv
         a0 = _log(P, "after cleanup", a0)
@@ -170,10 +196,17 @@ class DAPTriMulIn(nn.Module):
 
             i_start = src * N_local
             i_end = min(i_start + N_local, N_full)
-            out[:, i_start:i_end, :, :] = torch.einsum(
-                "bkid,bkjd->bijd", a_chunk[:, :, :i_end - i_start, :], b
-            )
-            a0 = _log(P, f"einsum src={src} i=[{i_start}:{i_end}]", a0)
+            i_span = i_end - i_start
+            micro_i = _micro_chunk_size("i", i_span)
+            for ii in range(i_start, i_end, micro_i):
+                ii_e = min(ii + micro_i, i_end)
+                r0 = ii - i_start
+                r1 = ii_e - i_start
+                a_sub = a_chunk[:, :, r0:r1, :]
+                out[:, ii:ii_e, :, :] = torch.einsum(
+                    "bkid,bkjd->bijd", a_sub, b
+                )
+            a0 = _log(P, f"einsum src={src} i=[{i_start}:{i_end}] micro={micro_i}", a0)
 
         del a, b, a_contig, a_recv
         a0 = _log(P, "after cleanup", a0)
