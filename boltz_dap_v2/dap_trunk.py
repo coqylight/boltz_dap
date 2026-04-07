@@ -1367,33 +1367,34 @@ def _run_template_dap(tmpl_module, z_scattered, feats, pair_mask, use_kernels, o
 
     # Prepare pair_mask for scattered template PF
     # pair_mask is [B, N, N]. We need it scattered: [B, N/dap, N]
-    pair_mask_tmpl = pair_mask[:, :, :original_N]  # ensure original_N
+    pair_mask_tmpl_base = pair_mask[:, :, :original_N]  # ensure original_N
     if dap_size > 1:
-        pair_mask_tmpl = scatter(pair_mask_tmpl, dim=1)  # [B, N/dap, N]
-
-    # Expand mask for T templates: [B*T, N/dap, N]
-    pair_mask_tmpl = pair_mask_tmpl[:, None].expand(-1, T, -1, -1)
-    pair_mask_tmpl = pair_mask_tmpl.reshape(B * T, *pair_mask_tmpl.shape[2:])
-
-    # v: [B, T, N/dap, N, template_dim] → [B*T, N/dap, N, template_dim]
-    v = v.view(B * T, *v.shape[2:])
-
-    if mem_log:
-        mem_log("  template: v scattered, entering PF")
+        pair_mask_tmpl_base = scatter(pair_mask_tmpl_base, dim=1)  # [B, N/dap, N]
 
     # Run DAP-wrapped pairformer (2 layers)
-    # Set chunk size
+    # Set chunk size for triangular attention (tri_att_start / tri_att_end).
+    # Env BOLTZ_TEMPLATE_TRI_ATT_CHUNK overrides everything (integer >= 1).
+    # Without override: long templates still spike in softmax inside chunk_layer;
+    # pentadecamer-scale N (~8k+) with chunk=8 has OOM'd after tri_mul — use 4 or 2.
     if not tmpl_module.pairformer.training:
-        if original_N > const.chunk_size_threshold:
-            # For very long sequences, use even smaller chunks to prevent OOM
-            # Q@K^T shape: [chunk, H, N, N] × 4 bytes
-            chunk_size_tri_attn = 8 if original_N > 2000 else 32
+        _env_ta = os.environ.get("BOLTZ_TEMPLATE_TRI_ATT_CHUNK", "").strip()
+        if _env_ta:
+            chunk_size_tri_attn = max(1, int(_env_ta))
+        elif original_N > const.chunk_size_threshold:
+            # Q@K^T / softmax in tri attention scale with chunk and N; see boltz triangular_attention.
+            if original_N > 8000:
+                chunk_size_tri_attn = 2
+            elif original_N > 4000:
+                chunk_size_tri_attn = 4
+            elif original_N > 2000:
+                chunk_size_tri_attn = 8
+            else:
+                chunk_size_tri_attn = 32
         else:
             chunk_size_tri_attn = 128
     else:
         chunk_size_tri_attn = None
 
-    pf_input = v
     from boltz.model.layers.pairformer import get_dropout_mask as _pfnoseq_dropout
 
     def _save_subop_gather(label, z_scat, li):
@@ -1408,121 +1409,171 @@ def _run_template_dap(tmpl_module, z_scattered, feats, pair_mask, use_kernels, o
             print(f"        [SUBOP pf{li}] {label}: mean={_fl.mean():.6f} std={_fl.std():.4f} absmax={_fl.abs().max():.4f}")
         del _full
 
-    for _li, layer in enumerate(tmpl_module.pairformer.layers):
-        # IMPORTANT: Force use_kernels=False so both 1-GPU (original layers)
-        # and 2-GPU (DAP-wrapped layers) use the same PyTorch-native code path.
-        _tmpl_use_kernels = False
-        _save_subop_gather("input", pf_input, _li)
+    def _template_pf_stack_forward(
+        v_flat: Tensor,
+        pair_mask_tmpl: Tensor,
+        *,
+        log_prefix: str = "",
+    ) -> Tensor:
+        """PairformerNoSeq stack: v_flat [B*Tn, N/dap, N, C], mask [B*Tn, N/dap, N]."""
+        pf_input = v_flat
+        v_init = v_flat
+        for _li, layer in enumerate(tmpl_module.pairformer.layers):
+            _tmpl_use_kernels = False
+            _save_subop_gather("input", pf_input, _li)
 
-        # 1. tri_mul_out
-        dropout = _pfnoseq_dropout(layer.dropout, pf_input, layer.training)
-        pf_input = pf_input + dropout * layer.tri_mul_out(
-            pf_input, mask=pair_mask_tmpl, use_kernels=_tmpl_use_kernels
-        )
-        if mem_log:
-            mem_log(f"  template: PF[{_li}] after tri_mul_out")
-        _save_subop_gather("after_tri_mul_out", pf_input, _li)
-
-        # 2. tri_mul_in — needs row_to_col transpose for DAP
-        if dap_size > 1:
-            z_col = row_to_col(pf_input)
-            pair_mask_col = row_to_col(pair_mask_tmpl.unsqueeze(-1)).squeeze(-1)
-            # Zero out padded positions
-            N_pad = z_col.shape[1]
-            if N_pad > original_N:
-                z_col[:, original_N:, :, :] = 0
-                pair_mask_col[:, original_N:, :] = 0
-            dropout = _pfnoseq_dropout(layer.dropout, z_col, layer.training)
-            z_col = z_col + dropout * layer.tri_mul_in(
-                z_col, mask=pair_mask_col, use_kernels=_tmpl_use_kernels
-            )
-            pf_input = col_to_row(z_col)
-            del z_col
-            if pf_input.shape[2] > original_N:
-                pf_input = pf_input[:, :, :original_N, :]
-        else:
             dropout = _pfnoseq_dropout(layer.dropout, pf_input, layer.training)
-            pf_input = pf_input + dropout * layer.tri_mul_in(
+            pf_input = pf_input + dropout * layer.tri_mul_out(
                 pf_input, mask=pair_mask_tmpl, use_kernels=_tmpl_use_kernels
             )
-        if mem_log:
-            mem_log(f"  template: PF[{_li}] after tri_mul_in")
-        _save_subop_gather("after_tri_mul_in", pf_input, _li)
+            if mem_log:
+                mem_log(f"  {log_prefix}template: PF[{_li}] after tri_mul_out")
+            _save_subop_gather("after_tri_mul_out", pf_input, _li)
 
-        # 3. tri_att_start (already DAP-wrapped via DAPPairformerNoSeqLayer injection)
-        dropout = _pfnoseq_dropout(layer.dropout, pf_input, layer.training)
-        pf_input = pf_input + dropout * layer.tri_att_start(
-            pf_input, mask=pair_mask_tmpl, chunk_size=chunk_size_tri_attn,
-            use_kernels=_tmpl_use_kernels,
-        )
-        if mem_log:
-            mem_log(f"  template: PF[{_li}] after tri_att_start")
-        _save_subop_gather("after_tri_att_start", pf_input, _li)
+            if dap_size > 1:
+                z_col = row_to_col(pf_input)
+                pair_mask_col = row_to_col(pair_mask_tmpl.unsqueeze(-1)).squeeze(-1)
+                N_pad = z_col.shape[1]
+                if N_pad > original_N:
+                    z_col[:, original_N:, :, :] = 0
+                    pair_mask_col[:, original_N:, :] = 0
+                dropout = _pfnoseq_dropout(layer.dropout, z_col, layer.training)
+                z_col = z_col + dropout * layer.tri_mul_in(
+                    z_col, mask=pair_mask_col, use_kernels=_tmpl_use_kernels
+                )
+                pf_input = col_to_row(z_col)
+                del z_col
+                if pf_input.shape[2] > original_N:
+                    pf_input = pf_input[:, :, :original_N, :]
+            else:
+                dropout = _pfnoseq_dropout(layer.dropout, pf_input, layer.training)
+                pf_input = pf_input + dropout * layer.tri_mul_in(
+                    pf_input, mask=pair_mask_tmpl, use_kernels=_tmpl_use_kernels
+                )
+            if mem_log:
+                mem_log(f"  {log_prefix}template: PF[{_li}] after tri_mul_in")
+            _save_subop_gather("after_tri_mul_in", pf_input, _li)
 
-        # 4. tri_att_end (already DAP-wrapped via DAPPairformerNoSeqLayer injection)
-        dropout = _pfnoseq_dropout(layer.dropout, pf_input, layer.training, columnwise=True)
-        pf_input = pf_input + dropout * layer.tri_att_end(
-            pf_input, mask=pair_mask_tmpl, chunk_size=chunk_size_tri_attn,
-            use_kernels=_tmpl_use_kernels,
-        )
-        if mem_log:
-            mem_log(f"  template: PF[{_li}] after tri_att_end")
-        _save_subop_gather("after_tri_att_end", pf_input, _li)
+            dropout = _pfnoseq_dropout(layer.dropout, pf_input, layer.training)
+            pf_input = pf_input + dropout * layer.tri_att_start(
+                pf_input, mask=pair_mask_tmpl, chunk_size=chunk_size_tri_attn,
+                use_kernels=_tmpl_use_kernels,
+            )
+            if mem_log:
+                mem_log(f"  {log_prefix}template: PF[{_li}] after tri_att_start")
+            _save_subop_gather("after_tri_att_start", pf_input, _li)
 
-        # 5. transition_z
-        pf_input = pf_input + layer.transition_z(pf_input)
-        if mem_log:
-            mem_log(f"  template: PF[{_li}] after transition")
-        _save_subop_gather("after_transition", pf_input, _li)
+            dropout = _pfnoseq_dropout(layer.dropout, pf_input, layer.training, columnwise=True)
+            pf_input = pf_input + dropout * layer.tri_att_end(
+                pf_input, mask=pair_mask_tmpl, chunk_size=chunk_size_tri_attn,
+                use_kernels=_tmpl_use_kernels,
+            )
+            if mem_log:
+                mem_log(f"  {log_prefix}template: PF[{_li}] after tri_att_end")
+            _save_subop_gather("after_tri_att_end", pf_input, _li)
 
-        # Log PF layer output (debug only — gather is collective)
+            pf_input = pf_input + layer.transition_z(pf_input)
+            if mem_log:
+                mem_log(f"  {log_prefix}template: PF[{_li}] after transition")
+            _save_subop_gather("after_transition", pf_input, _li)
+
+            if _tmpl_debug:
+                _pf_full = gather(pf_input.contiguous(), dim=1)
+                if dap_rank == 0:
+                    _pff = _pf_full[:, :N, :N, :].float()
+                    print(f"      [R{_ri}/TMPL] v_after_pf{_li}: mean={_pff.mean():.6f} std={_pff.std():.4f} absmax={_pff.abs().max():.4f} (gathered)")
+                    if recycle_idx == 0:
+                        _gran_ckpts[f"tmpl/v_after_pf{_li}"] = _pf_full[:, :N, :N, :].cpu().to(torch.bfloat16)
+                del _pf_full
+            if mem_log:
+                mem_log(f"  {log_prefix}template: PF layer[{_li}] done")
+
+        v_out = v_init + pf_input
+        del pf_input
+        if mem_log:
+            mem_log(f"  {log_prefix}template: PF residual added")
         if _tmpl_debug:
-            _pf_full = gather(pf_input.contiguous(), dim=1)
+            _vr_full = gather(v_out.contiguous(), dim=1)
             if dap_rank == 0:
-                _pff = _pf_full[:, :N, :N, :].float()
-                print(f"      [R{_ri}/TMPL] v_after_pf{_li}: mean={_pff.mean():.6f} std={_pff.std():.4f} absmax={_pff.abs().max():.4f} (gathered)")
+                _vrf = _vr_full[:, :N, :N, :].float()
+                print(f"      [R{_ri}/TMPL] v_residual: mean={_vrf.mean():.6f} std={_vrf.std():.4f} absmax={_vrf.abs().max():.4f} (gathered)")
                 if recycle_idx == 0:
-                    _gran_ckpts[f"tmpl/v_after_pf{_li}"] = _pf_full[:, :N, :N, :].cpu().to(torch.bfloat16)
-            del _pf_full
+                    _gran_ckpts["tmpl/v_residual"] = _vr_full[:, :N, :N, :].cpu().to(torch.bfloat16)
+            del _vr_full
+        return v_out
+
+    chunk_sz = getattr(tmpl_module, "template_t_chunk_size", None)
+    use_t_chunks = chunk_sz is not None and chunk_sz > 0 and chunk_sz < T
+
+    if use_t_chunks:
         if mem_log:
-            mem_log(f"  template: PF layer[{_li}] done")
+            mem_log(
+                f"  template: T-chunk PF (template_t_chunk_size={chunk_sz}, T={T})"
+            )
+        u_accum = torch.zeros(
+            B,
+            v.shape[2],
+            v.shape[3],
+            v.shape[-1],
+            device=v.device,
+            dtype=v.dtype,
+        )
+        nt_b = num_templates[:, None, None, None]
+        for t0 in range(0, T, chunk_sz):
+            t1 = min(t0 + chunk_sz, T)
+            t_sub = t1 - t0
+            if mem_log:
+                mem_log(f"  template: PF chunk T[{t0}:{t1}] ({t_sub} templates)")
+            v_sub = v[:, t0:t1].contiguous()
+            pair_mask_tmpl = (
+                pair_mask_tmpl_base[:, None, :, :]
+                .expand(-1, t_sub, -1, -1)
+                .reshape(B * t_sub, *pair_mask_tmpl_base.shape[1:])
+            )
+            v_flat = v_sub.view(B * t_sub, *v_sub.shape[2:])
+            log_pfx = f"T[{t0}:{t1}] "
+            v_pf = _template_pf_stack_forward(
+                v_flat, pair_mask_tmpl, log_prefix=log_pfx
+            )
+            v_pf = tmpl_module.v_norm(v_pf)
+            v_pf = v_pf.view(B, t_sub, *v_pf.shape[1:])
+            mask_c = template_mask[:, t0:t1, None, None, None]
+            u_accum = u_accum + (v_pf * mask_c).sum(dim=1)
+            del v_sub, v_flat, pair_mask_tmpl, v_pf, mask_c
+        u = u_accum / nt_b.to(u_accum)
+        del u_accum, v
+        if mem_log:
+            mem_log("  template: aggregated over templates (T-chunk path)")
+    else:
+        # Expand mask for T templates: [B*T, N/dap, N]
+        pair_mask_tmpl = (
+            pair_mask_tmpl_base[:, None, :, :]
+            .expand(-1, T, -1, -1)
+            .reshape(B * T, *pair_mask_tmpl_base.shape[1:])
+        )
 
-    # v = v + pf_output (residual)
-    v = v + pf_input
-    del pf_input
+        v = v.view(B * T, *v.shape[2:])
 
-    if mem_log:
-        mem_log("  template: PF residual added")
+        if mem_log:
+            mem_log("  template: v scattered, entering PF")
 
-    # Log v_residual (debug only)
-    if _tmpl_debug:
-        _vr_full = gather(v.contiguous(), dim=1)
-        if dap_rank == 0:
-            _vrf = _vr_full[:, :N, :N, :].float()
-            print(f"      [R{_ri}/TMPL] v_residual: mean={_vrf.mean():.6f} std={_vrf.std():.4f} absmax={_vrf.abs().max():.4f} (gathered)")
-            if recycle_idx == 0:
-                _gran_ckpts["tmpl/v_residual"] = _vr_full[:, :N, :N, :].cpu().to(torch.bfloat16)
-        del _vr_full
+        v = _template_pf_stack_forward(v, pair_mask_tmpl, log_prefix="")
+        v = tmpl_module.v_norm(v)
+        v = v.view(B, T, *v.shape[1:])  # [B, T, N/dap, N, template_dim]
 
-    # Post-PF: norm, reshape, aggregate over templates
-    v = tmpl_module.v_norm(v)
-    v = v.view(B, T, *v.shape[1:])  # [B, T, N/dap, N, template_dim]
+        if _tmpl_debug:
+            _vn_full = gather(v.reshape(B * T, *v.shape[2:]).contiguous(), dim=1)
+            if dap_rank == 0 and recycle_idx == 0:
+                _gran_ckpts["tmpl/v_norm"] = _vn_full[:, :N, :N, :].cpu().to(torch.bfloat16)
+            del _vn_full
 
-    # Granular: v_norm (debug only)
-    if _tmpl_debug:
-        _vn_full = gather(v.reshape(B * T, *v.shape[2:]).contiguous(), dim=1)
-        if dap_rank == 0 and recycle_idx == 0:
-            _gran_ckpts["tmpl/v_norm"] = _vn_full[:, :N, :N, :].cpu().to(torch.bfloat16)
-        del _vn_full
+        tmask = template_mask[:, :, None, None, None]
+        ntemplates = num_templates[:, None, None, None]
+        u = (v * tmask).sum(dim=1) / ntemplates.to(v)
+        del v
 
-    # Aggregate templates
-    tmask = template_mask[:, :, None, None, None]
-    ntemplates = num_templates[:, None, None, None]
-    u = (v * tmask).sum(dim=1) / ntemplates.to(v)  # [B, N/dap, N, template_dim]
-    del v
-
-    if mem_log:
-        mem_log("  template: aggregated over templates")
+        if mem_log:
+            mem_log("  template: aggregated over templates")
 
     # Log u_agg (debug only)
     if _tmpl_debug:

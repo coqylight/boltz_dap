@@ -25,6 +25,7 @@ import time
 import subprocess as sp
 from dataclasses import asdict
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -135,6 +136,15 @@ class GPUMonitor:
 )
 @click.option("--seed", type=int, default=None, help="Random seed for deterministic runs")
 @click.option("--skip_processing", is_flag=True, help="Reuse existing out_dir/processed without running process_inputs")
+@click.option(
+    "--template-t-chunk-size",
+    type=int,
+    default=None,
+    help=(
+        "Boltz2 template module: run PairformerNoSeq in chunks along template count T "
+        "(reduces peak VRAM vs one B×T batch). E.g. 2 for large T and N."
+    ),
+)
 def main(
     data: str,
     out_dir: str,
@@ -157,6 +167,7 @@ def main(
     keep_pde_logits: bool = False,
     seed: int = None,
     skip_processing: bool = False,
+    template_t_chunk_size: Optional[int] = None,
 ):
     """Run Boltz 2 with proper FastFold-style DAP (no model duplication)."""
 
@@ -240,6 +251,7 @@ def main(
         BoltzProcessedInput,
         process_inputs,
         filter_inputs_structure,
+        _apply_template_t_chunk_size,
     )
     from boltz.model.models.boltz2 import Boltz2
     from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
@@ -333,8 +345,10 @@ def main(
         steering_args=asdict(steering_args),
     )
     model.eval()
-
+    _apply_template_t_chunk_size(model, template_t_chunk_size)
     rank_print(f"  ✓ Model loaded to CPU (all ranks)")
+    if template_t_chunk_size is not None:
+        rank_print(f"  ✓ template_t_chunk_size={template_t_chunk_size} (template module)")
 
     # ── Optional: FlexAttention for triangle attention (before DAP injection) ──
     if use_flex_attention_chunked:

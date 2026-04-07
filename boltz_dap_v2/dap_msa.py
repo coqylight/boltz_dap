@@ -189,6 +189,33 @@ class DAPMSALayer(nn.Module):
         return z, m
 
 
+def _pwa_s_chunk_size(num_s: int) -> int:
+    """MSA depth (S) chunk for proj_o matmul; full matmul if num_s <= chunk."""
+    v = os.environ.get("BOLTZ_PWA_S_CHUNK")
+    if v is not None:
+        return max(1, min(num_s, int(v)))
+    # Default caps peak temp for o_chunks @ W.T on large S (e.g. pentadecamer + 16 GPU).
+    # Override with BOLTZ_PWA_S_CHUNK if you need fewer S-steps (slower) or larger (more VRAM).
+    return min(num_s, 32)
+
+
+def _pwa_proj_o_matmul_s_chunked(o_chunks: Tensor, proj_o_weight_T: Tensor) -> Tensor:
+    """Compute ``o_chunks @ proj_o_weight_T`` with optional S chunks.
+
+    Rows along dim=1 (MSA depth S) are independent; chunking is bitwise-equivalent
+    to one matmul (same dtype/device), unlike approximations.
+    """
+    s_dim = o_chunks.shape[1]
+    cs = _pwa_s_chunk_size(s_dim)
+    if cs >= s_dim:
+        return o_chunks @ proj_o_weight_T
+    parts: list[Tensor] = []
+    for s0 in range(0, s_dim, cs):
+        s1 = min(s0 + cs, s_dim)
+        parts.append(o_chunks[:, s0:s1].contiguous() @ proj_o_weight_T)
+    return torch.cat(parts, dim=1)
+
+
 def _pwa_with_bias(pwa, m_normed, b_full, mask, chunk_heads):
     """Run PairWeightedAveraging with pre-computed z bias.
 
@@ -214,23 +241,45 @@ def _pwa_with_bias(pwa, m_normed, b_full, mask, chunk_heads):
                 :, head_idx * pwa.c_h : (head_idx + 1) * pwa.c_h
             ]
 
-            v = m_normed @ sliced_weight_proj_m.T
-            v = v.reshape(*v.shape[:3], 1, pwa.c_h)
-            v = v.permute(0, 3, 1, 2, 4)
+            w = torch.softmax(b_full_perm[:, head_idx : head_idx + 1], dim=-1)
 
-            w = torch.softmax(b_full_perm[:, head_idx:head_idx+1], dim=-1)
+            # Chunk along MSA depth S: avoid full-S tensors for v, g, o before proj_o.
+            # Same math as full einsum + g*o + proj_o; see _pwa_proj_o_matmul_s_chunked.
+            num_s = m_normed.shape[1]
+            cs = _pwa_s_chunk_size(num_s)
+            # Pre-allocate one [B, S, N, out] buffer and copy each S chunk into it.
+            # Avoids torch.cat(head_parts) allocating a second full-S tensor (OOM near cat).
+            block: Tensor | None = None
+            for s0 in range(0, num_s, cs):
+                s1 = min(s0 + cs, num_s)
+                m_s = m_normed[:, s0:s1, :, :]
+                v_s = m_s @ sliced_weight_proj_m.T
+                v_s = v_s.reshape(m_s.shape[0], m_s.shape[1], m_s.shape[2], 1, pwa.c_h)
+                v_s = v_s.permute(0, 3, 1, 2, 4)
 
-            g = m_normed @ sliced_weight_proj_g.T
-            g = g.sigmoid()
+                g_s = m_s @ sliced_weight_proj_g.T
+                g_s = g_s.sigmoid()
 
-            o = torch.einsum("bhij,bhsjd->bhsid", w, v)
-            o = o.permute(0, 2, 3, 1, 4)
-            o = o.reshape(*o.shape[:3], 1 * pwa.c_h)
-            o_chunks = g * o
+                o_s = torch.einsum("bhij,bhsjd->bhsid", w, v_s)
+                o_s = o_s.permute(0, 2, 3, 1, 4)
+                o_s = o_s.reshape(o_s.shape[0], o_s.shape[1], o_s.shape[2], pwa.c_h)
+
+                o_chunks_s = g_s * o_s
+                part = _pwa_proj_o_matmul_s_chunked(o_chunks_s, sliced_weight_proj_o.T)
+                if block is None:
+                    b_b, _, n_tok, out_d = part.shape
+                    block = torch.empty(
+                        b_b, num_s, n_tok, out_d, dtype=part.dtype, device=part.device
+                    )
+                block[:, s0:s1].copy_(part)
+                del part
+            assert block is not None
             if head_idx == 0:
-                o_out = o_chunks @ sliced_weight_proj_o.T
+                o_out = block
             else:
-                o_out += o_chunks @ sliced_weight_proj_o.T
+                # In-place: o_out + block would allocate a full [B,S,N,out] (~GiB) per head.
+                o_out.add_(block)
+            del block
         return o_out
     else:
         # All heads at once
