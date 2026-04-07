@@ -1,18 +1,18 @@
-# Boltz-DAP: Distributed Axial Parallelism for Boltz 2
+# Boltz-DAP: Distributed Axial Parallelism for Boltz-2
 
-> Run [Boltz 2](https://github.com/jwohlwend/boltz) protein structure prediction on large complexes (hexamers, pentamers) that OOM on a single GPU.
+> Run [Boltz-2](https://github.com/jwohlwend/boltz) protein structure prediction on large complexes (>2,000 amino acid residues) across multiple GPUs without OOM.
 
 DAP (**D**ynamic **A**xial **P**arallelism) shards the pair representation `z [B, N, N, D]` across multiple GPUs along the row dimension, so no single GPU ever holds the full N×N tensor. This reduces peak memory proportionally to the number of GPUs — **4 GPUs → ~4× less memory per GPU**.
 
 ## Why?
 
-Original Boltz 2 holds the full pair tensor on **1 GPU**. For large complexes:
+Original Boltz-2 holds the full pair representation tensor on **1 GPU**. For large complexes (>2,000 residues), this leads to CUDA out-of-memory (OOM) errors in consumer grade GPUs (VRAM < 48 GB). DAP enables Boltz-2 to run on **multiple GPUs** without OOM, even for large complexes like adeno-associated virus (AAV) hexamers.
 
-| Complex | N (tokens) | Original Boltz 2 | DAP (4 GPUs) |
+| Complex | N (tokens) | Original Boltz-2 | DAP (4 × RTX 5880 Ada 48 GB VRAM) |
 |---------|-----------|------------------|--------------|
-| Trimer (3 × 519 aa) | ~1,557 | ⚠️ Tight | ✅ ~12 GB/GPU |
-| Pentamer (5 × 519 aa) | ~2,595 | ❌ OOM | ✅ ~36 GB/GPU |
-| Hexamer (6 × 519 aa) | ~3,114 | ❌ OOM | ✅ ~45 GB/GPU |
+| AAV2 VP3 Trimer (3 × 519 aa) | ~1,557 | ⚠️ Tight | ✅ ~12 GB/GPU |
+| AAV2 VP3 Pentamer (5 × 519 aa) | ~2,595 | ❌ OOM | ✅ ~36 GB/GPU |
+| AAV2 VP3 Hexamer (6 × 519 aa) | ~3,114 | ❌ OOM | ✅ ~45 GB/GPU |
 
 ## How It Works
 
@@ -56,21 +56,21 @@ The full `z` is only materialized at scatter/gather boundaries. The entire trunk
 
 - **2+ GPUs** on the same node (NVLink recommended)
 - Python 3.10+, PyTorch 2.x with CUDA
-- [Boltz 2](https://github.com/jwohlwend/boltz) installed (`pip install boltz`)
+- [Boltz-2](https://github.com/jwohlwend/boltz) installed (`pip install boltz`)
 
 ### Tested environment
 
 | Item | Used in development |
 |------|---------------------|
-| GPU | NVIDIA H800 (2, 4, or 8 per node) |
+| GPU | NVIDIA RTX 5880 Ada (48 GB VRAM) <br> NVIDIA H800 (80 GB VRAM) |
 | CUDA | Compatible with PyTorch 2.x |
-| GPU counts tested | 2, 4, 8 GPUs (e.g. trimer/hexamer on 4; 9MME N≈4642 on 8) |
-| Settings tested | **Boltz2 default**: `recycling_steps=3`, `sampling_steps=200`, `diffusion_samples=1` · **AF3 default**: `recycling_steps=10`, `sampling_steps=200`, `diffusion_samples=25` |
-| Workloads | Trimer (e.g. 3×519 aa), hexamer (6×~519 aa, 25 samples with `--use_flex_attention_chunked`), 9MME (N≈4642, 8 GPUs) |
+| GPU counts tested | 2, 4, 8 GPUs |
+| Settings tested | **Boltz-2 default**: `recycling_steps=3`, `sampling_steps=200`, `diffusion_samples=1`<br> **AF3 default**: `recycling_steps=10`, `sampling_steps=200`, `diffusion_samples=25` |
+| Workloads | AAV2 VP3 Trimer/Pentamer (e.g. 3×519 aa, 5×519 aa, 4 GPUs) <br> AAV2 VP3 Hexamer (6×519 aa, 25 samples with `--use_flex_attention_chunked`, 4 GPUs) <br> 9MME (4642 tokens, 8 GPUs) |
 
 Other GPU models (A100, V100, etc.) should work with 2+ GPUs; memory per GPU scales with shard size.
 
-**Example log file:** [example_hexamer_25cif_full.log](example_hexamer_25cif_full.log) — full run that produced 25 CIF files (hexamer, 4 GPUs, `--use_flex_attention_chunked`, AF3 defaults). Large (~8.8 MB) but useful as a reference.
+**Example log file:** [example_hexamer_25cif_full.log](example_hexamer_25cif_full.log) — full run that produced 25 CIF files (AAV2 VP3 Hexamer, 4 GPUs, `--use_flex_attention_chunked`, AF3 defaults). Large (~8.8 MB) but useful as a reference.
 
 ### Running
 
@@ -144,7 +144,6 @@ sbatch repro/hexamer_repro.sbatch
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-task=1
 #SBATCH --mem=128G
-#SBATCH --time=1:00:00
 
 srun torchrun --nproc_per_node=4 \
     boltz_dap_v2/run_boltz_dap_v2.py \
@@ -180,9 +179,9 @@ boltz_dap/
 
 ## Key Design Decisions
 
-### Zero Boltz 2 Modifications
+### Zero Boltz-2 Modifications
 
-DAP **does not modify any original Boltz 2 source code**. Instead, it monkey-patches the model at runtime:
+DAP **does not modify any original Boltz-2 source code**. Instead, it monkey-patches the model at runtime:
 
 ```python
 # dap_trunk.py
@@ -212,14 +211,56 @@ For triangle attention and sequence attention, only the small **bias tensor** `[
 
 ## Numerical Accuracy
 
-DAP produces results with minor floating-point differences from single-GPU Boltz 2, due to different operation ordering in distributed reductions. Structure predictions (LDDT, TM-score) are statistically equivalent.
+DAP produces results with minor floating-point differences from single-GPU Boltz-2, due to different operation ordering in distributed reductions. Structure predictions (LDDT, TM-score) are statistically equivalent.
 
 ## References
-
-- [Boltz 2](https://github.com/jwohlwend/boltz) — Base model
+If you found this project useful, please cite:
+- [Boltz-2](https://github.com/jwohlwend/boltz) — Base model
 - [FastFold](https://github.com/hpcaitech/FastFold) — DAP communication primitives (adapted)
-- [AlphaFold 3](https://doi.org/10.1038/s41586-024-07487-w) — Triangle operations architecture
+- [AlphaFold 3](https://github.com/google-deepmind/alphafold3) — Triangle operations architecture (adapted)
+- [ColabFold](https://github.com/sokrypton/ColabFold) — ColabFold MSA server
+
+We would also appreciate it if you could cite this repository in any work that uses or builds upon it. A formal citation will be provided in a preprint describing our implementation, benchmarks, and results on our AAV multimer structure prediction with this approach.
 
 ## License
 
-This DAP wrapper follows the same license as Boltz 2.
+This DAP wrapper follows the same MIT license as Boltz-2.
+
+## Further Advancement
+
+For any inquiries, please email {gleeai, wjkimab}@connect.ust.hk, we would be happy to help with anything we could.
+
+## Acknowledgements
+
+We sincerely thank:
+- the original Boltz-2 team for fully open-sourcing their state-of-the-art biomolecular structure prediction models,
+- the FastFold team for their open-source distributed communication utilities,
+- the AlphaFold 3 team for open-sourcing their inference code and model weights,
+- the deep learning for biomolecular interaction modeling and the broader AI for Science communities for their ongoing contributions in this exciting field, and
+- the developers and maintainers of all the packages used in this project!
+
+This project was developed with generous compute support in HKUST HPC4 and SuperPOD from The Hong Kong University of Science and Technology (HKUST). This work was conducted at the lab of Prof. Bonnie Danqing Zhu in the Department of Chemical and Biological Engineering (CBE). 
+
+We note the parallel development of [Fold-CP](https://github.com/NVIDIA-Digital-Bio/boltz-cp) by the team at NVIDIA Digital Bio, which also enables multi-GPU Boltz-2 inference (and also training) with a different approach. We look forward to comparing and learning from each other's implementations!
+
+## Differences with [Fold-CP](https://github.com/NVIDIA-Digital-Bio/boltz-cp)
+
+Adapted from [boltz2_cp_prediction](https://github.com/NVIDIA-Digital-Bio/boltz-cp/blob/main/docs/boltz2_cp_prediction.md). Most of the original serial prediction's features are supported by Boltz-DAP.
+
+| Aspect                | Boltz-DAP (`boltz_dap_v2/run_boltz_dap_v2.py`)        | Fold-CP (`src/boltz/distributed/main.py`)                                          |
+| --------------------- | ------------------------------------------- | ------------------------------------------------------------------------------------- |
+| Multi-GPU strategy    |                | `SingleDeviceStrategy` + DTensor CP mesh                                              |
+| Device management     |       | `DistributedManager` via `--size_dp`, `--size_cp`                                     |
+| Launch method         | `torchrun` or `srun`          | `torchrun` or `srun`                                                                  |
+| Input formats         | `config_files` (YAML/FASTA), `preprocessed` | `preprocessed` only                                                                   |
+| `num_workers`         | Configurable                                | Fixed at `0` (DTensor CP requires main-process collation)                             |
+| Precision             | Lightning `--precision` string              | Top-level `--precision` enum                                                          |
+| Attention backends    |                             | `--triattn_backend`, `--sdpa_with_bias_backend`, `--sdpa_with_bias_shardwise_backend` |
+| CUDA memory profiling |                                | `--cuda_memory_profile` flag                                                          |
+| Confidence prediction | **Supported**                                   | Not yet supported (`write_confidence_summary=False`)                                  |
+| Steering potentials   | **Supported**                                   | Not yet supported                                                                     |
+| Affinity prediction   | **Supported**                                   | Not yet supported                                                                     |
+| Template features     | **Supported**                                   | Weights loaded but distributed TemplateModule not yet implemented                     |
+| Constraint features   | **Supported**                                   | Not yet supported                                                                     |
+| Checkpoint loading    |                            | Reads checkpoint hparams, merges v2 flags, loads with `strict=True`                   |
+| Output writing        | All ranks write                             | Only CP rank 0 per DP group writes output                                             |
