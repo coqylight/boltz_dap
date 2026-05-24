@@ -16,7 +16,6 @@ Requirements:
     - boltz environment activated
 """
 
-import gc
 import os
 import sys
 import warnings
@@ -130,6 +129,12 @@ class GPUMonitor:
 )
 @click.option("--seed", type=int, default=None, help="Random seed for deterministic runs")
 @click.option("--skip_processing", is_flag=True, help="Reuse existing out_dir/processed without running process_inputs")
+@click.option(
+    "--template-t-chunk-size",
+    type=int,
+    default=None,
+    help="Boltz2 template_module.template_t_chunk_size (pairformer along T); lowers VRAM on large templates.",
+)
 def main(
     data: str,
     out_dir: str,
@@ -152,6 +157,7 @@ def main(
     keep_pde_logits: bool = False,
     seed: int = None,
     skip_processing: bool = False,
+    template_t_chunk_size: int | None = None,
 ):
     """Run Boltz 2 with proper FastFold-style DAP (no model duplication)."""
 
@@ -204,7 +210,7 @@ def main(
     rank_print(f"{'='*70}")
     rank_print(f"Input: {data}")
     rank_print(f"Output: {out_dir}")
-    rank_print(f"No model duplication — activations sharded across GPUs")
+    rank_print("No model duplication — activations sharded across GPUs")
     rank_print(
         "Trunk checkpoints: "
         + ("on" if save_trunk_checkpoints else "off")
@@ -235,11 +241,17 @@ def main(
         BoltzProcessedInput,
         process_inputs,
         filter_inputs_structure,
+        _apply_template_t_chunk_size,
     )
     from boltz.model.models.boltz2 import Boltz2
     from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
     from boltz.data.types import Manifest
     from boltz.data.write.writer import BoltzWriter
+    from boltz_compat import apply_boltz_compat_patches
+
+    patched_components = apply_boltz_compat_patches()
+    if patched_components:
+        rank_print("  ✓ Applied Boltz compatibility patches: " + ", ".join(patched_components))
 
     rank_print("[1/6] Processing input data...")
 
@@ -303,7 +315,7 @@ def main(
     if use_potentials:
         steering_args.fk_steering = True
         steering_args.physical_guidance_update = True
-        rank_print(f"  ✓ Potentials enabled: FK steering + physical guidance")
+        rank_print("  ✓ Potentials enabled: FK steering + physical guidance")
 
     predict_args = {
         "recycling_steps": recycling_steps,
@@ -328,8 +340,10 @@ def main(
         steering_args=asdict(steering_args),
     )
     model.eval()
-
-    rank_print(f"  ✓ Model loaded to CPU (all ranks)")
+    rank_print("  ✓ Model loaded to CPU (all ranks)")
+    _apply_template_t_chunk_size(model, template_t_chunk_size)
+    if template_t_chunk_size is not None:
+        rank_print(f"  ✓ template_t_chunk_size={template_t_chunk_size} (template pairformer)")
 
     # ── Optional: FlexAttention for triangle attention (before DAP injection) ──
     if use_flex_attention_chunked:
@@ -360,7 +374,7 @@ def main(
     # GPU 0: gets the FULL model (trunk + post-trunk)
     # GPU 1+: gets ONLY trunk modules (input_embedder, msa, pairformer,
     #         template, recycling). Post-trunk stays on CPU and is never used.
-    rank_print(f"\n[3/6] Placing modules on GPUs (selective, no duplication)...")
+    rank_print("\n[3/6] Placing modules on GPUs (selective, no duplication)...")
 
     # Trunk modules needed on ALL GPUs (for DAP):
     trunk_module_names = [
@@ -398,15 +412,15 @@ def main(
         print(f"  GPU {dap_rank}: Other post-trunk modules (structure, diffusion) stay on CPU")
 
     # Inject DAP wrappers
-    rank_print(f"\n[4/6] Injecting DAP wrappers...")
+    rank_print("\n[4/6] Injecting DAP wrappers...")
 
     from dap_trunk import inject_dap_into_model
     model = inject_dap_into_model(model)
 
-    rank_print(f"  ✓ DAP injection complete")
+    rank_print("  ✓ DAP injection complete")
 
     # Create data module
-    rank_print(f"\n[5/6] Running inference with DAP...")
+    rank_print("\n[5/6] Running inference with DAP...")
 
     data_module = Boltz2InferenceDataModule(
         manifest=processed.manifest,
@@ -481,7 +495,7 @@ def main(
         dist.barrier()
 
         if pred_dict is not None and pred_dict.get("exception", False):
-            rank_print(f"    ✗ OOM during inference!")
+            rank_print("    ✗ OOM during inference!")
             continue
 
         # Only rank 0 writes output
@@ -511,14 +525,14 @@ def main(
         monitor.report()
 
     # Check output
-    rank_print(f"\n[6/6] Checking output...")
+    rank_print("\n[6/6] Checking output...")
 
     if dap_rank == 0:
         cif_files = list((out_dir / "predictions").rglob("*.cif"))
         if cif_files:
             rank_print(f"  ✓ CIF file: {cif_files[0]}")
         else:
-            rank_print(f"  ✗ No CIF file found")
+            rank_print("  ✗ No CIF file found")
 
     rank_print(f"\n{'='*70}")
     rank_print("COMPLETE")
