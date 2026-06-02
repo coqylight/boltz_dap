@@ -166,6 +166,32 @@ def _patch_diffusion_transformer() -> bool:
     return True
 
 
+def apply_template_t_chunk_size(
+    model: torch.nn.Module, template_t_chunk_size: int | None
+) -> None:
+    """Set the template module's T-axis chunk size, if supported.
+
+    Defined here (instead of imported from ``boltz.main``) so Boltz-DAP runs on an
+    unmodified Boltz-2 install. On stock Boltz the template module has no
+    ``template_t_chunk_size`` attribute, so this is a no-op; the chunking feature
+    only takes effect on a Boltz build that supports it.
+    """
+
+    if template_t_chunk_size is None:
+        return
+    if not getattr(model, "use_templates", False):
+        return
+    tmpl = model.template_module
+    if getattr(model, "is_template_compiled", False):
+        tmpl = tmpl._orig_mod  # noqa: SLF001
+    if hasattr(tmpl, "template_t_chunk_size"):
+        tmpl.template_t_chunk_size = int(template_t_chunk_size)
+
+
+# Backwards-compatible alias for the symbol previously imported from boltz.main.
+_apply_template_t_chunk_size = apply_template_t_chunk_size
+
+
 def apply_boltz_compat_patches() -> list[str]:
     """Apply Boltz-DAP compatibility patches and return patched component names."""
 

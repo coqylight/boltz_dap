@@ -241,13 +241,15 @@ def main(
         BoltzProcessedInput,
         process_inputs,
         filter_inputs_structure,
-        _apply_template_t_chunk_size,
     )
     from boltz.model.models.boltz2 import Boltz2
     from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
     from boltz.data.types import Manifest
     from boltz.data.write.writer import BoltzWriter
-    from boltz_compat import apply_boltz_compat_patches
+    from boltz_compat import (
+        apply_boltz_compat_patches,
+        _apply_template_t_chunk_size,
+    )
 
     patched_components = apply_boltz_compat_patches()
     if patched_components:
