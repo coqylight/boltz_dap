@@ -111,13 +111,20 @@ class GPUMonitor:
 @click.option("--write_full_pde/--no_write_full_pde", default=True, help="Dump full PDE matrix to npz (default: on)")
 @click.option(
     "--save_trunk_checkpoints/--no_save_trunk_checkpoints",
-    default=True,
-    help="Save large trunk_checkpoints.pt debug artifact (default: on)",
+    default=False,
+    help=(
+        "Save large trunk_checkpoints.pt debug artifact (default: off). "
+        "Enabling this gathers the full z tensor to CPU at every recycling step "
+        "and can OOM host RAM on large complexes; only use for baseline comparison."
+    ),
 )
 @click.option(
     "--save_granular_checkpoints/--no_save_granular_checkpoints",
-    default=True,
-    help="Save granular_ckpts.pt debug artifact (default: on)",
+    default=False,
+    help=(
+        "Save granular_ckpts.pt debug artifact (default: off). "
+        "Accumulates many full N x N tensors on CPU; debug/comparison use only."
+    ),
 )
 @click.option("--dc_pairwise_chunk_size", type=int, default=512, help="Row chunk size for diffusion pairwise conditioner")
 @click.option("--dc_token_bias_chunk_size", type=int, default=256, help="Row chunk size for diffusion token_trans_bias")
@@ -149,8 +156,8 @@ def main(
     use_potentials: bool = False,
     write_full_pae: bool = False,
     write_full_pde: bool = False,
-    save_trunk_checkpoints: bool = True,
-    save_granular_checkpoints: bool = True,
+    save_trunk_checkpoints: bool = False,
+    save_granular_checkpoints: bool = False,
     dc_pairwise_chunk_size: int = 512,
     dc_token_bias_chunk_size: int = 256,
     dc_atom_encoder_chunk_size: int = 256,
