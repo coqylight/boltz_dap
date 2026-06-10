@@ -99,11 +99,19 @@ def init_dap(dap_size=None):
             
             from datetime import timedelta
             nccl_timeout = int(os.environ.get('NCCL_TIMEOUT', 7200))
-            torch.distributed.init_process_group(
+            init_kwargs = dict(
                 backend='nccl',
                 init_method='env://',
                 timeout=timedelta(seconds=nccl_timeout),  # default 2h — --no_kernels diffusion can take >45 min
             )
+            try:
+                torch.distributed.init_process_group(
+                    **init_kwargs,
+                    device_id=torch.device(f"cuda:{local_rank}"),
+                )
+            except TypeError:
+                # Older PyTorch versions do not accept device_id.
+                torch.distributed.init_process_group(**init_kwargs)
         
         _DAP_SIZE = torch.distributed.get_world_size()
         _DAP_RANK = torch.distributed.get_rank()

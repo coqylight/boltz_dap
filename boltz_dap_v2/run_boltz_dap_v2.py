@@ -33,6 +33,33 @@ import torch
 import torch.distributed as dist
 
 
+def _process_ram_mb() -> tuple[int | None, int | None, int | None]:
+    """Return process RSS plus cgroup memory usage/limit in MB when available."""
+    rss_mb = None
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    rss_mb = int(line.split()[1]) // 1024
+                    break
+    except OSError:
+        pass
+
+    cgroup_used_mb = None
+    cgroup_limit_mb = None
+    try:
+        with open("/sys/fs/cgroup/memory.current") as f:
+            cgroup_used_mb = int(f.read().strip()) // (1024 * 1024)
+        with open("/sys/fs/cgroup/memory.max") as f:
+            raw_limit = f.read().strip()
+            if raw_limit != "max":
+                cgroup_limit_mb = int(raw_limit) // (1024 * 1024)
+    except OSError:
+        pass
+
+    return rss_mb, cgroup_used_mb, cgroup_limit_mb
+
+
 class GPUMonitor:
     """Monitor GPU memory during inference."""
 
@@ -74,13 +101,23 @@ class GPUMonitor:
 
     def _monitor(self):
         with open(self.log_file, 'w') as f:
-            f.write("timestamp,gpu_id,mem_used_mb,mem_total_mb,util_pct,temp_c\n")
+            f.write(
+                "timestamp,gpu_id,mem_used_mb,mem_total_mb,util_pct,temp_c,"
+                "rank0_rss_mb,cgroup_used_mb,cgroup_limit_mb\n"
+            )
             start_time = time.time()
             while self.running:
                 elapsed = time.time() - start_time
                 mem_info = self._get_gpu_memory()
+                rss_mb, cgroup_used_mb, cgroup_limit_mb = _process_ram_mb()
+                rss_field = "" if rss_mb is None else str(rss_mb)
+                cgroup_used_field = "" if cgroup_used_mb is None else str(cgroup_used_mb)
+                cgroup_limit_field = "" if cgroup_limit_mb is None else str(cgroup_limit_mb)
                 for gpu_id, used, total, util, temp in mem_info:
-                    f.write(f"{elapsed:.1f},{gpu_id},{used},{total},{util},{temp}\n")
+                    f.write(
+                        f"{elapsed:.1f},{gpu_id},{used},{total},{util},{temp},"
+                        f"{rss_field},{cgroup_used_field},{cgroup_limit_field}\n"
+                    )
                     if gpu_id not in self.max_memory or used > self.max_memory[gpu_id]:
                         self.max_memory[gpu_id] = used
                 f.flush()
@@ -177,6 +214,12 @@ def main(
     dap_size = get_dap_size()
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     device = torch.device(f'cuda:{local_rank}')
+
+    def dist_barrier() -> None:
+        try:
+            dist.barrier(device_ids=[local_rank])
+        except TypeError:
+            dist.barrier()
 
     # Deterministic seeding for controlled A/B testing
     if seed is not None:
@@ -290,7 +333,7 @@ def main(
                 max_msa_seqs=8192,
             )
 
-    dist.barrier()
+    dist_barrier()
 
     # Load manifest
     manifest = Manifest.load(out_dir / "processed" / "manifest.json")
@@ -501,7 +544,7 @@ def main(
         print(f"    GPU {dap_rank}: Peak memory: {peak_mem:.0f} MB ({peak_mem/1024:.1f} GB)")
 
         # Barrier to sync all GPUs before next batch
-        dist.barrier()
+        dist_barrier()
 
         if pred_dict is not None and pred_dict.get("exception", False):
             rank_print("    ✗ OOM during inference!")
@@ -547,7 +590,7 @@ def main(
     rank_print("COMPLETE")
     rank_print(f"{'='*70}\n")
 
-    dist.barrier()
+    dist_barrier()
     dist.destroy_process_group()
 
 

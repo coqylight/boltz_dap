@@ -30,6 +30,33 @@ from dap_pairformer import DAPPairformerLayer
 _DEBUG_CONF_CALL_IDX = [0]
 
 
+def _process_ram_mb() -> tuple[int | None, int | None, int | None]:
+    """Return process RSS plus cgroup memory usage/limit in MB when available."""
+    rss_mb = None
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    rss_mb = int(line.split()[1]) // 1024
+                    break
+    except OSError:
+        pass
+
+    cgroup_used_mb = None
+    cgroup_limit_mb = None
+    try:
+        with open("/sys/fs/cgroup/memory.current") as f:
+            cgroup_used_mb = int(f.read().strip()) // (1024 * 1024)
+        with open("/sys/fs/cgroup/memory.max") as f:
+            raw_limit = f.read().strip()
+            if raw_limit != "max":
+                cgroup_limit_mb = int(raw_limit) // (1024 * 1024)
+    except OSError:
+        pass
+
+    return rss_mb, cgroup_used_mb, cgroup_limit_mb
+
+
 def _dict_tensors_to_cpu(obj):
     """Recursively move tensors in nested dict to CPU (for pair_chains_iptm)."""
     if isinstance(obj, torch.Tensor):
@@ -126,6 +153,12 @@ def run_confidence_dap(
     dap_size = get_dap_size()
     dap_rank = get_dap_rank()
     conf = model.confidence_module
+
+    def _barrier() -> None:
+        try:
+            torch.distributed.barrier(device_ids=[dap_rank])
+        except TypeError:
+            torch.distributed.barrier()
 
     # Extract z from z_holder early (before multiplicity branch)
     # NOTE: on non-primary ranks, z may be None (only rank 0 holds full z).
@@ -229,7 +262,14 @@ def run_confidence_dap(
         free_cuda, total_cuda = torch.cuda.mem_get_info(dev)
         free_mb = free_cuda // (1024 * 1024)
         elapsed = _time.time() - _conf_t0
-        print(f"    [CONF R{dap_rank}]  {elapsed:6.1f}s | alloc={alloc:6d}MB | resv={resv:6d}MB | free={free_mb:6d}MB | {label}", flush=True)
+        rss_mb, cgroup_used_mb, cgroup_limit_mb = _process_ram_mb()
+        ram = f" | rss={rss_mb:6d}MB" if rss_mb is not None else ""
+        if cgroup_used_mb is not None:
+            if cgroup_limit_mb is None:
+                ram += f" | cgroup={cgroup_used_mb:6d}MB/max"
+            else:
+                ram += f" | cgroup={cgroup_used_mb:6d}/{cgroup_limit_mb}MB"
+        print(f"    [CONF R{dap_rank}]  {elapsed:6.1f}s | alloc={alloc:6d}MB | resv={resv:6d}MB | free={free_mb:6d}MB{ram} | {label}", flush=True)
 
     _cmem("conf entry")
 
@@ -736,7 +776,7 @@ def run_confidence_dap(
 
         if dap_rank == 0:
             z_row = torch.empty(B, row_chunk_r, N, D_z_chunk, dtype=z_chunk.dtype, device=z_chunk.device)
-        torch.distributed.barrier()
+        _barrier()
         # Send only row_chunk_r rows: last rank has z_chunk [B, 390, N, D] but only 387 are valid (row_chunk_r)
         if dap_rank == r_idx and r_idx != 0:
             torch.distributed.send(z_chunk[:, :row_chunk_r, :, :].contiguous(), dst=0)
@@ -745,7 +785,7 @@ def run_confidence_dap(
                 z_row.copy_(z_chunk)
             else:
                 torch.distributed.recv(z_row, src=r_idx)
-        torch.distributed.barrier()
+        _barrier()
         # Gather columns [r_start:r_end_col] from all ranks → z_col [B, N, col_chunk_size, D]
         if dap_rank == 0:
             z_col_parts = []
@@ -814,7 +854,7 @@ def run_confidence_dap(
         # Masks / distogram prob only used inside chunked PDE; drop before 3c to free GB-scale GPU.
         del pred_distogram_prob, prob_contact, token_pad_pair_mask, contacts
         del token_pair_mask, token_interface_pair_mask, asym_id_rep
-    torch.distributed.barrier()
+    _barrier()
     _cmem("chunked PDE done")
 
     # 3c. GPU 0: run metrics (no full z)

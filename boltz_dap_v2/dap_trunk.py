@@ -36,6 +36,33 @@ from dap_pairformer_noseq import DAPPairformerNoSeqLayer
 from dap_confidence import inject_dap_into_confidence, run_confidence_dap
 
 
+def _process_ram_mb() -> tuple[int | None, int | None, int | None]:
+    """Return process RSS plus cgroup memory usage/limit in MB when available."""
+    rss_mb = None
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    rss_mb = int(line.split()[1]) // 1024
+                    break
+    except OSError:
+        pass
+
+    cgroup_used_mb = None
+    cgroup_limit_mb = None
+    try:
+        with open("/sys/fs/cgroup/memory.current") as f:
+            cgroup_used_mb = int(f.read().strip()) // (1024 * 1024)
+        with open("/sys/fs/cgroup/memory.max") as f:
+            raw_limit = f.read().strip()
+            if raw_limit != "max":
+                cgroup_limit_mb = int(raw_limit) // (1024 * 1024)
+    except OSError:
+        pass
+
+    return rss_mb, cgroup_used_mb, cgroup_limit_mb
+
+
 def _run_atom_encoder_with_chunked_zcond(ae, feats, s_trunk, z_cond, chunk_rows: int):
     """Run :class:`AtomEncoder` forward with chunked ``z_to_p`` from ``z_cond``.
 
@@ -253,6 +280,18 @@ def _zs_checkpoint(label, z_scattered, s, original_N):
     """
     dap_rank = get_dap_rank()
     dap_size = get_dap_size()
+
+    # These checkpoints are diagnostic artifacts. They gather the full
+    # [B, N, N, C] pair tensor to CPU at every recycling label, which can OOM
+    # host RAM in Kubernetes even when GPU memory is fine. Default to off unless
+    # explicitly enabled.
+    if os.environ.get("BOLTZ_SAVE_TRUNK_CKPT", "0") != "1":
+        if dap_rank == 0:
+            _v = os.environ.get("BOLTZ_SAVE_TRUNK_CKPT", "")
+            print(
+                f"    [CKP] [{label}]  (skipped full gather - BOLTZ_SAVE_TRUNK_CKPT={_v})"
+            )
+        return {"z": torch.zeros(1), "s": torch.zeros(1)}
     
     if dap_size > 1:
         N_padded = ((original_N + dap_size - 1) // dap_size) * dap_size
@@ -318,7 +357,14 @@ def _make_dap_forward(model):
             if peak > prev_peak:
                 _peak_changes.append((label, prev_peak, peak))
                 marker = f"  ◀◀ NEW PEAK (+{peak - prev_peak}MB)"
-            print(f"    [TIMELINE] {elapsed:7.1f}s | alloc={alloc:>6d}MB | peak={peak:>6d}MB | {label}{marker}")
+            rss_mb, cgroup_used_mb, cgroup_limit_mb = _process_ram_mb()
+            ram = f" | rss={rss_mb:>6d}MB" if rss_mb is not None else ""
+            if cgroup_used_mb is not None:
+                if cgroup_limit_mb is None:
+                    ram += f" | cgroup={cgroup_used_mb:>6d}MB/max"
+                else:
+                    ram += f" | cgroup={cgroup_used_mb:>6d}/{cgroup_limit_mb}MB"
+            print(f"    [TIMELINE] {elapsed:7.1f}s | alloc={alloc:>6d}MB | peak={peak:>6d}MB{ram} | {label}{marker}")
 
         def _print_peak_summary():
             """Print definitive summary of where the peak was set."""
@@ -588,7 +634,7 @@ def _make_dap_forward(model):
                         if hasattr(msa, '_orig_mod') and not model.training:
                             msa = msa._orig_mod
 
-                        _save_gran_ckpt = os.environ.get("BOLTZ_SAVE_GRAN_CKPT", "1") == "1"
+                        _save_gran_ckpt = os.environ.get("BOLTZ_SAVE_GRAN_CKPT", "0") == "1"
                         z_before_msa = z_scattered
                         z_msa_out = _run_msa_dap(
                             msa, z_scattered, s_inputs, feats,
@@ -683,7 +729,7 @@ def _make_dap_forward(model):
 
                 # Save checkpoints only when explicitly enabled; these artifacts are
                 # very large and not needed for normal inference runs.
-                _save_trunk_ckpt = os.environ.get("BOLTZ_SAVE_TRUNK_CKPT", "1") == "1"
+                _save_trunk_ckpt = os.environ.get("BOLTZ_SAVE_TRUNK_CKPT", "0") == "1"
                 if dap_rank == 0 and _save_trunk_ckpt:
                     import os as _os
                     _out_dir = _os.environ.get('BOLTZ_OUT_DIR', '')
@@ -1066,7 +1112,10 @@ def _make_dap_forward(model):
                     # (ranks 1-3 peaked at ~70GB during trunk PF, still reserved)
                     torch.cuda.empty_cache()
                     import torch.distributed as tdist
-                    tdist.barrier()
+                    try:
+                        tdist.barrier(device_ids=[dap_rank])
+                    except TypeError:
+                        tdist.barrier()
 
                 # Confidence module with DAP (ALL GPUs participate)
                 if model.confidence_prediction:
@@ -1187,7 +1236,7 @@ def _run_template_dap(tmpl_module, z_scattered, feats, pair_mask, use_kernels, o
 
     dap_size = get_dap_size()
     dap_rank = get_dap_rank()
-    _save_gran_ckpt = os.environ.get("BOLTZ_SAVE_GRAN_CKPT", "1") == "1"
+    _save_gran_ckpt = os.environ.get("BOLTZ_SAVE_GRAN_CKPT", "0") == "1"
     _tmpl_debug = os.environ.get("BOLTZ_TEMPLATE_DEBUG", "0") == "1" and _save_gran_ckpt
 
     # Granular checkpoint dict (R0 only, rank 0 only, debug only)
@@ -1626,7 +1675,7 @@ def _run_msa_dap(msa_module, z_scattered, s_inputs, feats, full_pair_mask, use_k
         layer._diag_enabled = _msa_diag and (i <= 1)
 
         # Enable granular checkpoints on block 0 when diagnostics are active
-        _save_gran_ckpt = os.environ.get("BOLTZ_SAVE_GRAN_CKPT", "1") == "1"
+        _save_gran_ckpt = os.environ.get("BOLTZ_SAVE_GRAN_CKPT", "0") == "1"
 
         if _msa_diag and _save_gran_ckpt and i == 0:
             layer._save_gran_ckpts = True
