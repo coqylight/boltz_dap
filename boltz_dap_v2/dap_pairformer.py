@@ -21,9 +21,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from boltz_distributed.comm import row_to_col, col_to_row, gather, scatter
 from boltz_distributed.core import get_dap_size, get_dap_rank
 
+from dap_dtype_guard import (
+    ensure_bf16_row_to_col_input,
+    get_pair_storage_dtype,
+    restore_pair_storage_dtype,
+)
 from dap_trimul import DAPTriMulOut, DAPTriMulIn
 from dap_tri_att import DAPTriAttStart, DAPTriAttEnd
-from dap_pairformer_noseq import get_dropout_mask
+from dap_pairformer_noseq import get_dropout_mask, _module_compute_dtype
 
 
 class DAPPairformerLayer(nn.Module):
@@ -56,6 +61,7 @@ class DAPPairformerLayer(nn.Module):
         mask: Tensor,
         pair_mask: Tensor,
         chunk_size_tri_attn: Optional[int] = None,
+        chunk_size_transition_z: Optional[int] = None,
         use_kernels: bool = False,
         use_cuequiv_mul: bool = False,
         use_cuequiv_attn: bool = False,
@@ -71,6 +77,8 @@ class DAPPairformerLayer(nn.Module):
         dap_size = get_dap_size()
         dap_rank = get_dap_rank()
         original_N = z.shape[2]
+        pair_storage_dtype = get_pair_storage_dtype()
+        z = restore_pair_storage_dtype(z, dtype=pair_storage_dtype)
 
         # Sub-op checkpointing: only for layer 0
         # NOTE: gather() is NCCL collective — ALL ranks must call it!
@@ -102,18 +110,24 @@ class DAPPairformerLayer(nn.Module):
         # 1. TriMulOut
         dropout = get_dropout_mask(self.dropout, z, self.training)
         z = z + dropout * self.tri_mul_out(z, mask=pair_mask, use_kernels=use_kernels)
+        z = restore_pair_storage_dtype(z, dtype=pair_storage_dtype)
         _mem("after tri_mul_out")
         _save_z("after_trimul_out")
 
         # 2. TriMulIn (col-scattered round-trip)
+        ensure_bf16_row_to_col_input(
+            z, tag="pairformer.tri_mul_in", rank=dap_rank
+        )
         z_col = row_to_col(z)
         pair_mask_col = row_to_col(pair_mask.unsqueeze(-1)).squeeze(-1)
         dropout = get_dropout_mask(self.dropout, z_col, self.training)
         z_col = z_col + dropout * self.tri_mul_in(z_col, mask=pair_mask_col, use_kernels=use_kernels)
+        z_col = restore_pair_storage_dtype(z_col, dtype=pair_storage_dtype)
         z = col_to_row(z_col)
         del z_col
         if z.shape[2] > original_N:
             z = z[:, :, :original_N, :]
+        z = restore_pair_storage_dtype(z, dtype=pair_storage_dtype)
         _mem("after tri_mul_in")
         _save_z("after_trimul_in")
 
@@ -122,6 +136,7 @@ class DAPPairformerLayer(nn.Module):
         z = z + dropout * self.tri_att_start(
             z, mask=pair_mask, chunk_size=chunk_size_tri_attn, use_kernels=use_kernels,
         )
+        z = restore_pair_storage_dtype(z, dtype=pair_storage_dtype)
         _mem("after tri_att_start")
         _save_z("after_triatt_start")
 
@@ -130,24 +145,37 @@ class DAPPairformerLayer(nn.Module):
         z = z + dropout * self.tri_att_end(
             z, mask=pair_mask, chunk_size=chunk_size_tri_attn, use_kernels=use_kernels,
         )
+        z = restore_pair_storage_dtype(z, dtype=pair_storage_dtype)
         _mem("after tri_att_end")
         _save_z("after_triatt_end")
 
         # 5. Transition (pointwise, chunked to avoid 4×D expansion spike)
-        z = z + self.transition_z(z)
+        transition_dtype = _module_compute_dtype(self.transition_z)
+        transition_out = self.transition_z(
+            z.to(dtype=transition_dtype),
+            chunk_size_transition_z,
+        )
+        transition_out = restore_pair_storage_dtype(
+            transition_out, dtype=pair_storage_dtype
+        )
+        z = z + transition_out
+        del transition_out
+        z = restore_pair_storage_dtype(z, dtype=pair_storage_dtype)
         _mem("after transition_z")
 
         # === Sequence attention (gather only bias, not full z) ===
         # proj_z: z [B, I, J, D] → bias [B, H, I, J] (LayerNorm + Linear(D→H) + Rearrange)
         # Compute bias on scattered z, then gather only H channels (vs D=128)
+        pair_bias_input = z.to(dtype=_module_compute_dtype(self.attention.proj_z))
         if dap_size > 1:
             # z is [B, N/dap, N, D] → proj_z → [B, H, N/dap, N]
-            pair_bias = self.attention.proj_z(z)
+            pair_bias = self.attention.proj_z(pair_bias_input)
             # Gather along dim=2 (the scattered I dimension, now after rearrange to H-first)
             pair_bias = gather(pair_bias.contiguous(), dim=2, original_size=original_N)
             # pair_bias is now [B, H, N, N] — full bias, no full z needed!
         else:
-            pair_bias = self.attention.proj_z(z)
+            pair_bias = self.attention.proj_z(pair_bias_input)
+        del pair_bias_input
         _mem("after proj_z+gather")
 
         with torch.autocast("cuda", enabled=False):

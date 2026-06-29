@@ -22,7 +22,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from boltz_distributed.comm import gather, scatter
 from boltz_distributed.core import get_dap_size, get_dap_rank
 
-from dap_pairformer_noseq import DAPPairformerNoSeqLayer, get_dropout_mask
+from dap_dtype_guard import get_pair_storage_dtype, restore_pair_storage_dtype
+from dap_pairformer_noseq import (
+    DAPPairformerNoSeqLayer,
+    _module_compute_dtype,
+    _restore_storage_dtype,
+    get_dropout_mask,
+)
 
 
 class DAPMSALayer(nn.Module):
@@ -72,6 +78,9 @@ class DAPMSALayer(nn.Module):
         dap_size = get_dap_size()
         dap_rank = get_dap_rank()
         original_N = z.shape[2]  # full N from the non-scattered dim
+        z_storage_dtype = get_pair_storage_dtype()
+        z = restore_pair_storage_dtype(z, dtype=z_storage_dtype)
+        m_storage_dtype = m.dtype
 
         # ── Fine-grained memory logging ──
         _msa_diag = getattr(self, '_diag_enabled', False)
@@ -93,7 +102,9 @@ class DAPMSALayer(nn.Module):
 
         # Compute proj_z on scattered z → [B, N/dap, N, H]
         # Then gather only the small bias, not full z
-        z_normed_scattered = pwa.norm_z(z)
+        z_for_pwa = z.to(dtype=_module_compute_dtype(pwa.norm_z))
+        z_normed_scattered = pwa.norm_z(z_for_pwa)
+        del z_for_pwa
         b_scattered = pwa.proj_z(z_normed_scattered)  # [B, N/dap, N, H=8]
         del z_normed_scattered
         b_full = gather(b_scattered.contiguous(), dim=1,
@@ -102,16 +113,33 @@ class DAPMSALayer(nn.Module):
 
         # Run PWA manually with pre-computed bias
         m_normed = pwa.norm_m(m)
-        pwa_out = _pwa_with_bias(pwa, m_normed, b_full, token_mask,
-                                  chunk_heads_pwa)
+        pwa_s_chunk = int(os.environ.get("BOLTZ_PWA_S_CHUNK", "0"))
+        if pwa_s_chunk > 0 and not self.training:
+            _apply_pwa_with_bias_inplace(
+                pwa=pwa,
+                m=m,
+                m_normed=m_normed,
+                b_full=b_full,
+                mask=token_mask,
+                msa_dropout=msa_dropout,
+                chunk_heads=chunk_heads_pwa,
+                s_chunk_size=pwa_s_chunk,
+            )
+            pwa_out = None
+        else:
+            pwa_out = _pwa_with_bias(pwa, m_normed, b_full, token_mask,
+                                      chunk_heads_pwa)
         del b_full
-        m = m + msa_dropout * pwa_out
-        del pwa_out
+        if pwa_out is not None:
+            m = m + msa_dropout * pwa_out
+            del pwa_out
+        m = _restore_storage_dtype(m, m_storage_dtype)
 
         _msa_mem("after PWA")
 
         # 2. MSA transition (pointwise on m, no z involved)
         m = m + self.msa_transition(m, chunk_size_transition_msa)
+        m = _restore_storage_dtype(m, m_storage_dtype)
 
         _msa_mem("after MSA transition")
 
@@ -134,6 +162,7 @@ class DAPMSALayer(nn.Module):
         )
         z = z + opm_scattered
         del opm_scattered
+        z = restore_pair_storage_dtype(z, dtype=z_storage_dtype)
 
         _msa_mem("after OPM")
 
@@ -162,11 +191,14 @@ class DAPMSALayer(nn.Module):
         # Force use_kernels=False for MSA PF to match PyTorch-native DAP ops
         _msa_use_kernels = False
 
+        z = restore_pair_storage_dtype(z, dtype=z_storage_dtype)
         z = self.pairformer_layer(
             z, pair_mask_scattered,
             chunk_size_tri_attn=chunk_size_tri_attn,
+            chunk_size_transition_z=chunk_size_transition_z,
             use_kernels=_msa_use_kernels,
         )
+        z = restore_pair_storage_dtype(z, dtype=z_storage_dtype)
 
         if _msa_diag and dap_rank == 0:
             torch.cuda.synchronize()
@@ -252,6 +284,41 @@ def _pwa_with_bias(pwa, m_normed, b_full, mask, chunk_heads):
         return o
 
 
+def _apply_pwa_with_bias_inplace(
+    pwa,
+    m: Tensor,
+    m_normed: Tensor,
+    b_full: Tensor,
+    mask: Tensor,
+    msa_dropout,
+    chunk_heads: bool,
+    s_chunk_size: int,
+) -> None:
+    """Apply PWA update to m in S-chunks to cap peak memory.
+
+    This is mathematically equivalent to computing full pwa_out and then:
+      m = m + msa_dropout * pwa_out
+    but avoids materializing full [B, S, N, C] pwa_out at once.
+    """
+    s_chunk_size = max(1, int(s_chunk_size))
+    s_total = m_normed.shape[1]
+    for s0 in range(0, s_total, s_chunk_size):
+        s1 = min(s0 + s_chunk_size, s_total)
+        m_normed_chunk = m_normed[:, s0:s1]
+        pwa_out_chunk = _pwa_with_bias(
+            pwa, m_normed_chunk, b_full, mask, chunk_heads
+        )
+        if torch.is_tensor(msa_dropout):
+            if msa_dropout.dim() > 1 and msa_dropout.shape[1] != 1:
+                drop_chunk = msa_dropout[:, s0:s1]
+            else:
+                drop_chunk = msa_dropout
+            m[:, s0:s1] = m[:, s0:s1] + drop_chunk * pwa_out_chunk
+        else:
+            m[:, s0:s1] = m[:, s0:s1] + msa_dropout * pwa_out_chunk
+        del pwa_out_chunk
+
+
 def _opm_scattered(opm, m, mask, chunk_size):
     """Run OuterProductMean with row-scattered output.
 
@@ -295,6 +362,23 @@ def _opm_scattered(opm, m, mask, chunk_size):
             del cross
         num_mask = num_mask.clamp(min=1)
 
+        out_features = opm.proj_o.out_features
+        out_chunk = int(os.environ.get("BOLTZ_OPM_OUT_CHUNK", "0"))
+        if out_chunk <= 0:
+            full_n = num_mask.shape[2]
+            out_chunk = 8 if full_n >= 8000 else out_features
+        out_chunk = max(1, min(out_features, out_chunk))
+
+        # Preallocate the scattered output once, then accumulate projected
+        # OPM chunks in-place to avoid materializing a second full z_out tensor.
+        z_out = torch.empty(
+            (*num_mask.shape[:3], out_features),
+            device=m.device,
+            dtype=m.dtype,
+        )
+        z_out[:] = opm.proj_o.bias.to(dtype=m.dtype)
+        z_out_flat = z_out.reshape(-1, out_features)
+
         # Compute in chunks over c_hidden (same as original OPM)
         for i in range(0, opm.c_hidden, chunk_size):
             a_chunk = a_scattered[:, :, :, i:i+chunk_size]
@@ -304,12 +388,14 @@ def _opm_scattered(opm, m, mask, chunk_size):
             # einsum: [B,S,N/dap,c_chunk] x [B,S,N,c_h] → [B,N/dap,N,c_chunk*c_h]
             z = torch.einsum("bsic,bsjd->bijcd", a_chunk, b)
             z = z.reshape(*z.shape[:3], -1)
-            z = z / num_mask
-            if i == 0:
-                z_out = z.to(m) @ sliced_weight.T
-            else:
-                z_out = z_out + z.to(m) @ sliced_weight.T
-        z_out = z_out + opm.proj_o.bias
+            z = (z / num_mask).to(m)
+            z_flat = z.reshape(-1, z.shape[-1])
+            for out_start in range(0, out_features, out_chunk):
+                out_end = min(out_start + out_chunk, out_features)
+                proj_chunk = sliced_weight[out_start:out_end]
+                z_out_flat[:, out_start:out_end].add_(z_flat @ proj_chunk.T)
+            del z_flat
+            del z
         return z_out
     else:
         # Non-chunked path — use float32 like original
@@ -324,4 +410,3 @@ def _opm_scattered(opm, m, mask, chunk_size):
         z = z / num_mask
         z = opm.proj_o(z.to(m))
         return z
-

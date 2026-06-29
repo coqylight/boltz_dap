@@ -19,6 +19,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from boltz_distributed.comm import row_to_col, col_to_row
 from boltz_distributed.core import get_dap_size, get_dap_rank
 
+from dap_dtype_guard import (
+    ensure_bf16_row_to_col_input,
+    get_pair_storage_dtype,
+    restore_pair_storage_dtype,
+)
 from dap_trimul import DAPTriMulOut, DAPTriMulIn
 from dap_tri_att import DAPTriAttStart, DAPTriAttEnd
 
@@ -35,6 +40,24 @@ def get_dropout_mask(dropout_rate, x, training, columnwise=False):
     mask = torch.ones(shape, device=x.device, dtype=x.dtype)
     mask = torch.nn.functional.dropout(mask, p=dropout_rate, training=True)
     return mask
+
+
+def _restore_storage_dtype(x: Tensor, dtype: torch.dtype) -> Tensor:
+    """Keep persistent pair activations in the layer-entry dtype.
+
+    Several pairformer sub-ops accumulate in float32 internally, which is fine
+    for math, but letting the residual stream stay in float32 doubles the
+    communication buffer size for the next `row_to_col` / `col_to_row`.
+    """
+    if x.dtype != dtype:
+        return x.to(dtype=dtype)
+    return x
+
+
+def _module_compute_dtype(module: nn.Module) -> torch.dtype:
+    """Use the wrapped module parameter dtype for non-DAP pointwise ops."""
+    param = next(module.parameters(), None)
+    return param.dtype if param is not None else torch.float32
 
 
 class DAPPairformerNoSeqLayer(nn.Module):
@@ -75,12 +98,15 @@ class DAPPairformerNoSeqLayer(nn.Module):
         z: Tensor,
         pair_mask: Tensor,
         chunk_size_tri_attn: Optional[int] = None,
+        chunk_size_transition_z: Optional[int] = None,
         use_kernels: bool = False,
         use_cuequiv_mul: bool = False,
         use_cuequiv_attn: bool = False,
     ) -> Tensor:
         """Forward: z [B, N/dap, N, D], pair_mask [B, N/dap, N]."""
         original_N = z.shape[2]
+        pair_storage_dtype = get_pair_storage_dtype()
+        z = restore_pair_storage_dtype(z, dtype=pair_storage_dtype)
         dap_rank = get_dap_rank() if hasattr(torch.distributed, 'is_initialized') and torch.distributed.is_initialized() else 0
         _save = self._save_subop_checkpoints
 
@@ -125,11 +151,15 @@ class DAPPairformerNoSeqLayer(nn.Module):
         a0 = _pre()
         dropout = get_dropout_mask(self.dropout, z, self.training)
         z = z + dropout * self.tri_mul_out(z, mask=pair_mask, use_kernels=use_kernels)
+        z = restore_pair_storage_dtype(z, dtype=pair_storage_dtype)
         _post("tri_mul_out", a0)
         _save_checkpoint("after_tri_mul_out", z)
 
         # 2. TriMulIn: col-scattered round-trip
         a0 = _pre()
+        ensure_bf16_row_to_col_input(
+            z, tag="pairformer_noseq.tri_mul_in", rank=dap_rank
+        )
         z_col = row_to_col(z)
         pair_mask_col = row_to_col(pair_mask.unsqueeze(-1)).squeeze(-1)
         # Zero out padded positions (N_pad > original_N) to prevent them from
@@ -140,10 +170,12 @@ class DAPPairformerNoSeqLayer(nn.Module):
             pair_mask_col[:, original_N:, :] = 0
         dropout = get_dropout_mask(self.dropout, z_col, self.training)
         z_col = z_col + dropout * self.tri_mul_in(z_col, mask=pair_mask_col, use_kernels=use_kernels)
+        z_col = restore_pair_storage_dtype(z_col, dtype=pair_storage_dtype)
         z = col_to_row(z_col)
         del z_col
         if z.shape[2] > original_N:
             z = z[:, :, :original_N, :]
+        z = restore_pair_storage_dtype(z, dtype=pair_storage_dtype)
         _post("tri_mul_in", a0)
         _save_checkpoint("after_tri_mul_in", z)
 
@@ -153,6 +185,7 @@ class DAPPairformerNoSeqLayer(nn.Module):
         z = z + dropout * self.tri_att_start(
             z, mask=pair_mask, chunk_size=chunk_size_tri_attn, use_kernels=use_kernels,
         )
+        z = restore_pair_storage_dtype(z, dtype=pair_storage_dtype)
         _post("tri_att_start", a0)
         _save_checkpoint("after_tri_att_start", z)
 
@@ -162,12 +195,23 @@ class DAPPairformerNoSeqLayer(nn.Module):
         z = z + dropout * self.tri_att_end(
             z, mask=pair_mask, chunk_size=chunk_size_tri_attn, use_kernels=use_kernels,
         )
+        z = restore_pair_storage_dtype(z, dtype=pair_storage_dtype)
         _post("tri_att_end", a0)
         _save_checkpoint("after_tri_att_end", z)
 
         # 5. Transition (pointwise)
         a0 = _pre()
-        z = z + self.transition_z(z)
+        transition_dtype = _module_compute_dtype(self.transition_z)
+        transition_out = self.transition_z(
+            z.to(dtype=transition_dtype),
+            chunk_size_transition_z,
+        )
+        transition_out = restore_pair_storage_dtype(
+            transition_out, dtype=pair_storage_dtype
+        )
+        z = z + transition_out
+        del transition_out
+        z = restore_pair_storage_dtype(z, dtype=pair_storage_dtype)
         _post("transition_z", a0)
         _save_checkpoint("after_transition", z)
 

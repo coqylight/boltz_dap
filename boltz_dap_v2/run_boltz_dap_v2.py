@@ -17,6 +17,8 @@ Requirements:
 """
 
 import gc
+import hashlib
+import json
 import os
 import sys
 import warnings
@@ -96,6 +98,98 @@ class GPUMonitor:
         print(f"{'='*60}")
 
 
+def _sha256_file(path: Path) -> str:
+    """Return SHA256 hash for an input file."""
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _build_processing_fingerprint(data: Path, use_msa_server: bool) -> dict:
+    """Build a reproducibility fingerprint for processed inputs."""
+    return {
+        "schema_version": 1,
+        "data_path": str(data.resolve()),
+        "data_sha256": _sha256_file(data),
+        "boltz2": True,
+        "use_msa_server": bool(use_msa_server),
+        "msa_server_url": "https://api.colabfold.com",
+        "msa_pairing_strategy": "greedy",
+        "max_msa_seqs": 8192,
+    }
+
+
+def _diff_fingerprint(old: dict, new: dict) -> str:
+    """Return human-readable changed keys between two fingerprints."""
+    changed = []
+    all_keys = sorted(set(old.keys()) | set(new.keys()))
+    for key in all_keys:
+        if old.get(key) != new.get(key):
+            changed.append(f"{key}: old={old.get(key)!r}, new={new.get(key)!r}")
+    return "; ".join(changed)
+
+
+def _is_oom_error(err: BaseException) -> bool:
+    """Return True when an exception indicates CUDA OOM."""
+    msg = str(err).lower()
+    return "out of memory" in msg or "cuda oom" in msg
+
+
+def _build_prediction_dict(model, batch: dict, out: dict) -> dict:
+    """Mirror Boltz2.predict_step output without using its soft-OOM path."""
+    pred_dict = {"exception": False}
+    if "keys_dict_batch" in model.predict_args:
+        for key in model.predict_args["keys_dict_batch"]:
+            pred_dict[key] = batch[key]
+
+    pred_dict["masks"] = batch["atom_pad_mask"]
+    pred_dict["token_masks"] = batch["token_pad_mask"]
+    pred_dict["s"] = out["s"]
+    pred_dict["z"] = out["z"]
+
+    if "keys_dict_out" in model.predict_args:
+        for key in model.predict_args["keys_dict_out"]:
+            pred_dict[key] = out[key]
+
+    pred_dict["coords"] = out["sample_atom_coords"]
+    if model.confidence_prediction:
+        pred_dict["pde"] = out["pde"]
+        pred_dict["plddt"] = out["plddt"]
+        pred_dict["confidence_score"] = (
+            4 * out["complex_plddt"]
+            + (
+                out["iptm"]
+                if not torch.allclose(out["iptm"], torch.zeros_like(out["iptm"]))
+                else out["ptm"]
+            )
+        ) / 5
+        pred_dict["complex_plddt"] = out["complex_plddt"]
+        pred_dict["complex_iplddt"] = out["complex_iplddt"]
+        pred_dict["complex_pde"] = out["complex_pde"]
+        pred_dict["complex_ipde"] = out["complex_ipde"]
+        if model.alpha_pae > 0:
+            pred_dict["pae"] = out["pae"]
+            pred_dict["ptm"] = out["ptm"]
+            pred_dict["iptm"] = out["iptm"]
+            pred_dict["ligand_iptm"] = out["ligand_iptm"]
+            pred_dict["protein_iptm"] = out["protein_iptm"]
+            pred_dict["pair_chains_iptm"] = out["pair_chains_iptm"]
+    if model.affinity_prediction:
+        pred_dict["affinity_pred_value"] = out["affinity_pred_value"]
+        pred_dict["affinity_probability_binary"] = out["affinity_probability_binary"]
+        if model.affinity_ensemble:
+            pred_dict["affinity_pred_value1"] = out["affinity_pred_value1"]
+            pred_dict["affinity_probability_binary1"] = out["affinity_probability_binary1"]
+            pred_dict["affinity_pred_value2"] = out["affinity_pred_value2"]
+            pred_dict["affinity_probability_binary2"] = out["affinity_probability_binary2"]
+    return pred_dict
+
+
 @click.command()
 @click.argument("data", type=click.Path(exists=True))
 @click.option("--out_dir", type=click.Path(), required=True)
@@ -107,18 +201,25 @@ class GPUMonitor:
 @click.option("--no_kernels", is_flag=True, help="Disable cuequivariance CUDA kernels (use PyTorch-native ops)")
 @click.option("--use_flex_attention", is_flag=True, help="Use FlexAttention for triangle attention (memory/throughput)")
 @click.option("--use_flex_attention_chunked", is_flag=True, help="Use chunked FlexAttention for DAP (experimental; avoids 112GB OOM)")
+@click.option(
+    "--run-profile",
+    type=click.Choice(["prod", "parity", "debug"], case_sensitive=False),
+    default="prod",
+    show_default=True,
+    help="Preset for runtime behavior: prod(min overhead), parity(deterministic + original math path), debug(keep diagnostics).",
+)
 @click.option("--use_potentials", is_flag=True, help="Enable FK steering + physical guidance potentials")
-@click.option("--write_full_pae/--no_write_full_pae", default=True, help="Dump full PAE matrix to npz (default: on)")
-@click.option("--write_full_pde/--no_write_full_pde", default=True, help="Dump full PDE matrix to npz (default: on)")
+@click.option("--write_full_pae/--no_write_full_pae", default=False, help="Dump full PAE matrix to npz (default: off)")
+@click.option("--write_full_pde/--no_write_full_pde", default=False, help="Dump full PDE matrix to npz (default: off)")
 @click.option(
     "--save_trunk_checkpoints/--no_save_trunk_checkpoints",
-    default=True,
-    help="Save large trunk_checkpoints.pt debug artifact (default: on)",
+    default=False,
+    help="Save large trunk_checkpoints.pt debug artifact (default: off)",
 )
 @click.option(
     "--save_granular_checkpoints/--no_save_granular_checkpoints",
-    default=True,
-    help="Save granular_ckpts.pt debug artifact (default: on)",
+    default=False,
+    help="Save granular_ckpts.pt debug artifact (default: off)",
 )
 @click.option("--dc_pairwise_chunk_size", type=int, default=512, help="Row chunk size for diffusion pairwise conditioner")
 @click.option("--dc_token_bias_chunk_size", type=int, default=256, help="Row chunk size for diffusion token_trans_bias")
@@ -130,6 +231,13 @@ class GPUMonitor:
 )
 @click.option("--seed", type=int, default=None, help="Random seed for deterministic runs")
 @click.option("--skip_processing", is_flag=True, help="Reuse existing out_dir/processed without running process_inputs")
+@click.option(
+    "--processed-dir",
+    "--processed_dir",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+    default=None,
+    help="Reuse processed inputs from this directory while writing predictions to out_dir.",
+)
 @click.option(
     "--template-t-chunk-size",
     type=int,
@@ -147,17 +255,19 @@ def main(
     no_kernels: bool = False,
     use_flex_attention: bool = False,
     use_flex_attention_chunked: bool = False,
+    run_profile: str = "prod",
     use_potentials: bool = False,
     write_full_pae: bool = False,
     write_full_pde: bool = False,
-    save_trunk_checkpoints: bool = True,
-    save_granular_checkpoints: bool = True,
+    save_trunk_checkpoints: bool = False,
+    save_granular_checkpoints: bool = False,
     dc_pairwise_chunk_size: int = 512,
     dc_token_bias_chunk_size: int = 256,
     dc_atom_encoder_chunk_size: int = 256,
     keep_pde_logits: bool = False,
     seed: int = None,
     skip_processing: bool = False,
+    processed_dir: str | None = None,
     template_t_chunk_size: int | None = None,
 ):
     """Run Boltz 2 with proper FastFold-style DAP (no model duplication)."""
@@ -171,6 +281,20 @@ def main(
     dap_size = get_dap_size()
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     device = torch.device(f'cuda:{local_rank}')
+
+    run_profile = run_profile.lower()
+    if run_profile == "parity":
+        # Parity mode pins execution to deterministic, PyTorch-native paths.
+        if seed is None:
+            seed = 0
+        no_kernels = True
+        use_flex_attention = False
+        use_flex_attention_chunked = False
+        # Disable heavy debug artifacts to avoid changing peak memory behavior.
+        save_trunk_checkpoints = False
+        save_granular_checkpoints = False
+        write_full_pae = False
+        write_full_pde = False
 
     # Deterministic seeding for controlled A/B testing
     if seed is not None:
@@ -209,8 +333,13 @@ def main(
     rank_print(f"\n{'='*70}")
     rank_print(f"BOLTZ 2 DAP v2 INFERENCE ({dap_size} GPUs)")
     rank_print(f"{'='*70}")
+    rank_print(f"Profile: {run_profile}")
     rank_print(f"Input: {data}")
+    processed_root = Path(processed_dir).expanduser() if processed_dir else out_dir / "processed"
+
     rank_print(f"Output: {out_dir}")
+    if processed_dir:
+        rank_print(f"Processed input dir: {processed_root}")
     rank_print(f"No model duplication — activations sharded across GPUs")
     rank_print(
         "Trunk checkpoints: "
@@ -255,32 +384,66 @@ def main(
     ccd_path = cache / "ccd.pkl"
     mol_dir = cache / "mols"
 
-    processed_manifest = out_dir / "processed" / "manifest.json"
+    processed_manifest = processed_root / "manifest.json"
+    fingerprint_path = processed_root / "input_fingerprint.json"
+    expected_fingerprint = _build_processing_fingerprint(data, use_msa_server)
+    processing_error = None
     if dap_rank == 0:
-        if skip_processing:
-            if not processed_manifest.exists():
-                raise FileNotFoundError(
-                    f"--skip_processing was set, but processed manifest was not found: {processed_manifest}"
+        try:
+            if processed_dir and not skip_processing:
+                raise ValueError(
+                    "--processed_dir is only valid with --skip_processing. "
+                    "Remove --processed_dir to regenerate processed inputs in out_dir."
                 )
-            rank_print("  ✓ Reusing existing processed inputs (skip_processing=True)")
-        else:
-            process_inputs(
-                data=[data],
-                out_dir=out_dir,
-                ccd_path=ccd_path,
-                mol_dir=mol_dir,
-                use_msa_server=use_msa_server,
-                msa_server_url="https://api.colabfold.com",
-                msa_pairing_strategy="greedy",
-                boltz2=True,
-                preprocessing_threads=1,
-                max_msa_seqs=8192,
-            )
+            if skip_processing:
+                if not processed_manifest.exists():
+                    raise FileNotFoundError(
+                        "--skip_processing was set, but processed manifest was not "
+                        f"found: {processed_manifest}"
+                    )
+                if not fingerprint_path.exists():
+                    raise FileNotFoundError(
+                        "--skip_processing was set, but input fingerprint is missing. "
+                        "Re-run once without --skip_processing to create it."
+                    )
+                stored_fingerprint = json.loads(fingerprint_path.read_text())
+                if stored_fingerprint != expected_fingerprint:
+                    diff_msg = _diff_fingerprint(stored_fingerprint, expected_fingerprint)
+                    raise RuntimeError(
+                        "Processed inputs were generated from different input/settings. "
+                        f"Changed fields: {diff_msg}. Re-run without --skip_processing."
+                    )
+                rank_print("  ✓ Reusing existing processed inputs (skip_processing=True)")
+            else:
+                process_inputs(
+                    data=[data],
+                    out_dir=out_dir,
+                    ccd_path=ccd_path,
+                    mol_dir=mol_dir,
+                    use_msa_server=use_msa_server,
+                    msa_server_url="https://api.colabfold.com",
+                    msa_pairing_strategy="greedy",
+                    boltz2=True,
+                    preprocessing_threads=1,
+                    max_msa_seqs=8192,
+                )
+                fingerprint_path.parent.mkdir(parents=True, exist_ok=True)
+                fingerprint_path.write_text(
+                    json.dumps(expected_fingerprint, indent=2, sort_keys=True) + "\n"
+                )
+        except Exception as err:
+            processing_error = f"{type(err).__name__}: {err}"
 
-    dist.barrier()
+    error_box = [processing_error]
+    dist.broadcast_object_list(error_box, src=0)
+    if error_box[0] is not None:
+        if monitor:
+            monitor.stop()
+        dist.destroy_process_group()
+        raise RuntimeError(f"Input processing preflight failed: {error_box[0]}")
 
     # Load manifest
-    manifest = Manifest.load(out_dir / "processed" / "manifest.json")
+    manifest = Manifest.load(processed_manifest)
     filtered_manifest = filter_inputs_structure(manifest=manifest, outdir=out_dir)
 
     if not filtered_manifest.records:
@@ -288,14 +451,13 @@ def main(
         dist.destroy_process_group()
         return
 
-    processed_dir = out_dir / "processed"
     processed = BoltzProcessedInput(
         manifest=filtered_manifest,
-        targets_dir=processed_dir / "structures",
-        msa_dir=processed_dir / "msa",
-        constraints_dir=(processed_dir / "constraints") if (processed_dir / "constraints").exists() else None,
-        template_dir=(processed_dir / "templates") if (processed_dir / "templates").exists() else None,
-        extra_mols_dir=(processed_dir / "mols") if (processed_dir / "mols").exists() else None,
+        targets_dir=processed_root / "structures",
+        msa_dir=processed_root / "msa",
+        constraints_dir=(processed_root / "constraints") if (processed_root / "constraints").exists() else None,
+        template_dir=(processed_root / "templates") if (processed_root / "templates").exists() else None,
+        extra_mols_dir=(processed_root / "mols") if (processed_root / "mols").exists() else None,
     )
 
     rank_print(f"  ✓ Processed {len(filtered_manifest.records)} input(s)")
@@ -459,20 +621,39 @@ def main(
         rank_print(f"  Running batch {batch_idx}...")
         N = batch.get("token_pad_mask", torch.tensor([])).shape[-1] if "token_pad_mask" in batch else 0
         rank_print(f"    Sequence length: {N}")
+
+        # For very large systems, force stronger MSA streaming to keep VRAM headroom.
+        # This only changes execution chunking (not model math).
+        if N >= 8000:
+            current_pwa_chunk = int(os.environ.get("BOLTZ_PWA_S_CHUNK", "0"))
+            if current_pwa_chunk <= 0 or current_pwa_chunk > 2:
+                os.environ["BOLTZ_PWA_S_CHUNK"] = "2"
+                rank_print("    [OOM-GUARD] BOLTZ_PWA_S_CHUNK set to 2 for N>=8000")
+            current_opm_out_chunk = int(os.environ.get("BOLTZ_OPM_OUT_CHUNK", "0"))
+            if current_opm_out_chunk <= 0 or current_opm_out_chunk > 8:
+                os.environ["BOLTZ_OPM_OUT_CHUNK"] = "8"
+                rank_print("    [OOM-GUARD] BOLTZ_OPM_OUT_CHUNK set to 8 for N>=8000")
+            current_trimul_out_tile = int(os.environ.get("BOLTZ_TRIMUL_OUT_TILE", "0"))
+            if current_trimul_out_tile <= 0 or current_trimul_out_tile > 256:
+                os.environ["BOLTZ_TRIMUL_OUT_TILE"] = "256"
+                rank_print("    [OOM-GUARD] BOLTZ_TRIMUL_OUT_TILE set to 256 for N>=8000")
+            current_tri_att_chunk = int(os.environ.get("BOLTZ_TRI_ATT_CHUNK", "0") or "0")
+            if current_tri_att_chunk <= 0 or current_tri_att_chunk > 2:
+                os.environ["BOLTZ_TRI_ATT_CHUNK"] = "2"
+                rank_print("    [OOM-GUARD] BOLTZ_TRI_ATT_CHUNK set to 2 for N>=8000")
+
         mem_before = torch.cuda.memory_allocated(device) / 1024**2
         rank_print(f"    Memory before forward: {mem_before:.0f} MB")
 
         torch.cuda.reset_peak_memory_stats(device)
 
-        if dap_rank == 0:
-            # Rank 0: full predict_step (calls DAP forward → structure → confidence)
+        pred_dict = None
+
+        try:
+            # All ranks follow the exact same DAP forward path. Rank 0 only
+            # converts the returned tensors into the writer/predict payload.
             with torch.no_grad():
-                pred_dict = model.predict_step(batch, batch_idx)
-        else:
-            # Non-primary: just call forward to participate in DAP trunk comms
-            # The DAP forward returns early after the trunk on non-primary ranks
-            with torch.no_grad():
-                _ = model(
+                model_out = model(
                     batch,
                     recycling_steps=recycling_steps,
                     num_sampling_steps=sampling_steps,
@@ -480,7 +661,18 @@ def main(
                     max_parallel_samples=1,
                     run_confidence_sequentially=True,
                 )
-            pred_dict = None
+            if dap_rank == 0:
+                pred_dict = _build_prediction_dict(model, batch, model_out)
+        except RuntimeError as err:
+            if _is_oom_error(err):
+                print(f"    GPU {dap_rank}: Runtime OOM in batch {batch_idx}; failing fast")
+                torch.cuda.empty_cache()
+                gc.collect()
+                raise RuntimeError(
+                    f"DAP inference OOM on rank {dap_rank}, batch {batch_idx}"
+                ) from err
+            else:
+                raise
 
         mem_after = torch.cuda.memory_allocated(device) / 1024**2
         peak_mem = torch.cuda.max_memory_allocated(device) / 1024**2
@@ -489,10 +681,6 @@ def main(
 
         # Barrier to sync all GPUs before next batch
         dist.barrier()
-
-        if pred_dict is not None and pred_dict.get("exception", False):
-            rank_print(f"    ✗ OOM during inference!")
-            continue
 
         # Only rank 0 writes output
         if dap_rank == 0 and pred_dict is not None:

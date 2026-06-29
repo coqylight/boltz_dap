@@ -20,6 +20,7 @@ from functools import partial
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 from boltz_distributed.comm import row_to_col, col_to_row, gather
 from boltz_distributed.core import get_dap_size, get_dap_rank
+from dap_dtype_guard import ensure_bf16_row_to_col_input
 
 from boltz.model.layers.triangular_attention.utils import (
     permute_final_dims,
@@ -28,6 +29,11 @@ from boltz.model.layers.triangular_attention.utils import (
 from boltz.model.layers.triangular_attention.primitives import (
     _attention,
 )
+
+
+def _module_compute_dtype(module: nn.Module) -> torch.dtype:
+    """Use original attention parameter dtype for pointwise math."""
+    return module.layer_norm.weight.dtype
 
 
 class DAPTriAttStart(nn.Module):
@@ -56,6 +62,13 @@ class DAPTriAttStart(nn.Module):
 
         if mask is None:
             mask = x.new_ones(x.shape[:-1])
+
+        storage_dtype = x.dtype
+        compute_dtype = _module_compute_dtype(self.inner)
+        if x.dtype != compute_dtype:
+            x = x.to(dtype=compute_dtype)
+        if mask.dtype != x.dtype:
+            mask = mask.to(dtype=x.dtype)
 
         # Layer norm (pointwise)
         x = self.inner.layer_norm(x)
@@ -96,6 +109,8 @@ class DAPTriAttStart(nn.Module):
                 use_kernels=use_kernels,
             )
 
+        if x.dtype != storage_dtype:
+            x = x.to(dtype=storage_dtype)
         return x
 
 
@@ -126,8 +141,13 @@ class DAPTriAttEnd(nn.Module):
             mask = x.new_ones(x.shape[:-1])
 
         original_N = x.shape[2]
+        dap_rank = get_dap_rank()
+        storage_dtype = x.dtype
 
         # 1. row_to_col: [B, N/dap, N, D] -> [B, N_pad, N/dap, D]
+        ensure_bf16_row_to_col_input(
+            x, tag="tri_att_end.row_to_col", rank=dap_rank
+        )
         x_col = row_to_col(x)
         mask_col = row_to_col(mask.unsqueeze(-1)).squeeze(-1)
 
@@ -141,6 +161,12 @@ class DAPTriAttEnd(nn.Module):
         x_t = x_col.transpose(-2, -3)
         mask_t = mask_col.transpose(-1, -2)
         del x_col, mask_col
+
+        compute_dtype = _module_compute_dtype(self.inner)
+        if x_t.dtype != compute_dtype:
+            x_t = x_t.to(dtype=compute_dtype)
+        if mask_t.dtype != x_t.dtype:
+            mask_t = mask_t.to(dtype=x_t.dtype)
 
         # 3. Layer norm (pointwise)
         x_t = self.inner.layer_norm(x_t)
@@ -182,6 +208,8 @@ class DAPTriAttEnd(nn.Module):
         # 7. Transpose back + col_to_row
         x_col_out = x_t.transpose(-2, -3)
         del x_t
+        if x_col_out.dtype != storage_dtype:
+            x_col_out = x_col_out.to(dtype=storage_dtype)
         x_out = col_to_row(x_col_out)
         del x_col_out
 
@@ -189,4 +217,6 @@ class DAPTriAttEnd(nn.Module):
         if x_out.shape[2] > original_N:
             x_out = x_out[:, :, :original_N, :]
 
+        if x_out.dtype != storage_dtype:
+            x_out = x_out.to(dtype=storage_dtype)
         return x_out

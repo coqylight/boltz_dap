@@ -21,13 +21,19 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from boltz_distributed.comm import scatter, gather
+from boltz_distributed.comm import scatter, gather, gather_to_rank0_cpu
 from boltz_distributed.core import get_dap_size, get_dap_rank
 
 from dap_pairformer import DAPPairformerLayer
 
 # Diagnostic: sequential inner-call index (set by outer loop, read after broadcast to debug shape corruption)
 _DEBUG_CONF_CALL_IDX = [0]
+
+
+def _module_compute_dtype(module: torch.nn.Module) -> torch.dtype:
+    """Use confidence head parameter dtype for Linear/LayerNorm inputs."""
+    param = next(module.parameters(), None)
+    return param.dtype if param is not None else torch.float32
 
 
 def _dict_tensors_to_cpu(obj):
@@ -37,6 +43,164 @@ def _dict_tensors_to_cpu(obj):
     if isinstance(obj, dict):
         return {k: _dict_tensors_to_cpu(v) for k, v in obj.items()}
     return obj
+
+
+def _distogram_contact_prob_cpu(
+    pred_distogram_logits: Tensor,
+    *,
+    contact_bins: int = 20,
+    row_chunk: int = 128,
+) -> Tensor:
+    """Compute contact probability from distogram logits without a full GPU copy."""
+    logits_cpu = pred_distogram_logits.detach()
+    if logits_cpu.device.type != "cpu":
+        logits_cpu = logits_cpu.cpu()
+    B, N, _N, _bins = logits_cpu.shape
+    out = torch.empty(B, N, N, dtype=torch.float32, device="cpu")
+    row_chunk = max(1, row_chunk)
+    for row_start in range(0, N, row_chunk):
+        row_end = min(row_start + row_chunk, N)
+        probs = torch.nn.functional.softmax(
+            logits_cpu[:, row_start:row_end].float(), dim=-1
+        )
+        out[:, row_start:row_end].copy_(probs[..., :contact_bins].sum(dim=-1))
+        del probs
+    return out
+
+
+def _pae_expected_from_logits(logits: Tensor, end: float = 32.0) -> Tensor:
+    """Compute expected PAE from logits, dropping the logits bin axis immediately."""
+    num_bins = logits.shape[-1]
+    bin_width = end / num_bins
+    bounds = torch.arange(
+        start=0.5 * bin_width,
+        end=end,
+        step=bin_width,
+        device=logits.device,
+        dtype=torch.float32,
+    )
+    probs = torch.nn.functional.softmax(logits.float(), dim=-1)
+    return torch.sum(probs * bounds.view(*((1,) * len(probs.shape[:-1])), -1), dim=-1)
+
+
+def _pae_tm_expected_from_logits(
+    logits: Tensor,
+    n_res: Tensor,
+    end: float = 32.0,
+) -> Tensor:
+    """Compute the TM-transformed PAE expectation used by PTM/iPTM."""
+    from boltz.model.layers.confidence_utils import tm_function
+
+    num_bins = logits.shape[-1]
+    bin_width = end / num_bins
+    pae_value = torch.arange(
+        start=0.5 * bin_width,
+        end=end,
+        step=bin_width,
+        device=logits.device,
+        dtype=torch.float32,
+    ).unsqueeze(0)
+    n_res = n_res.to(device=logits.device, dtype=torch.float32)
+    tm_value = tm_function(pae_value, n_res).unsqueeze(1).unsqueeze(2)
+    probs = torch.nn.functional.softmax(logits.float(), dim=-1)
+    return torch.sum(probs * tm_value, dim=-1)
+
+
+def _compute_ptms_from_tm_expected(
+    tm_expected_value: Tensor,
+    x_preds: Tensor,
+    feats: dict,
+    multiplicity: int,
+):
+    """Compute PTM/iPTM summaries from precomputed TM expected values."""
+    from boltz.data import const
+    from boltz.model.layers.confidence_utils import compute_frame_pred
+
+    _, mask_collinear_pred = compute_frame_pred(
+        x_preds, feats["frames_idx"], feats, multiplicity, inference=True
+    )
+    device = tm_expected_value.device
+    dtype = tm_expected_value.dtype
+    mask_pad = (
+        feats["token_pad_mask"]
+        .repeat_interleave(multiplicity, 0)
+        .to(device=device, dtype=dtype)
+    )
+    maski = mask_collinear_pred.reshape(-1, mask_collinear_pred.shape[-1]).to(
+        device=device, dtype=dtype
+    )
+    pair_mask_ptm = maski[:, :, None] * mask_pad[:, None, :] * mask_pad[:, :, None]
+    asym_id = feats["asym_id"].repeat_interleave(multiplicity, 0).to(device=device)
+    pair_mask_iptm = (
+        maski[:, :, None]
+        * (asym_id[:, None, :] != asym_id[:, :, None]).to(dtype)
+        * mask_pad[:, None, :]
+        * mask_pad[:, :, None]
+    )
+
+    ptm = torch.max(
+        torch.sum(tm_expected_value * pair_mask_ptm, dim=-1)
+        / (torch.sum(pair_mask_ptm, dim=-1) + 1e-5),
+        dim=1,
+    ).values
+    iptm = torch.max(
+        torch.sum(tm_expected_value * pair_mask_iptm, dim=-1)
+        / (torch.sum(pair_mask_iptm, dim=-1) + 1e-5),
+        dim=1,
+    ).values
+
+    token_type = feats["mol_type"].repeat_interleave(multiplicity, 0).to(device=device)
+    is_ligand_token = (token_type == const.chain_type_ids["NONPOLYMER"]).to(dtype)
+    is_protein_token = (token_type == const.chain_type_ids["PROTEIN"]).to(dtype)
+
+    ligand_iptm_mask = (
+        maski[:, :, None]
+        * (asym_id[:, None, :] != asym_id[:, :, None]).to(dtype)
+        * mask_pad[:, None, :]
+        * mask_pad[:, :, None]
+        * (
+            (is_ligand_token[:, :, None] * is_protein_token[:, None, :])
+            + (is_protein_token[:, :, None] * is_ligand_token[:, None, :])
+        )
+    )
+    protein_iptm_mask = (
+        maski[:, :, None]
+        * (asym_id[:, None, :] != asym_id[:, :, None]).to(dtype)
+        * mask_pad[:, None, :]
+        * mask_pad[:, :, None]
+        * (is_protein_token[:, :, None] * is_protein_token[:, None, :])
+    )
+
+    ligand_iptm = torch.max(
+        torch.sum(tm_expected_value * ligand_iptm_mask, dim=-1)
+        / (torch.sum(ligand_iptm_mask, dim=-1) + 1e-5),
+        dim=1,
+    ).values
+    protein_iptm = torch.max(
+        torch.sum(tm_expected_value * protein_iptm_mask, dim=-1)
+        / (torch.sum(protein_iptm_mask, dim=-1) + 1e-5),
+        dim=1,
+    ).values
+
+    chain_pair_iptm = {}
+    for idx1 in torch.unique(asym_id).tolist():
+        chain_iptm = {}
+        for idx2 in torch.unique(asym_id).tolist():
+            mask_pair_chain = (
+                maski[:, :, None]
+                * (asym_id[:, None, :] == idx1).to(dtype)
+                * (asym_id[:, :, None] == idx2).to(dtype)
+                * mask_pad[:, None, :]
+                * mask_pad[:, :, None]
+            )
+            chain_iptm[idx2] = torch.max(
+                torch.sum(tm_expected_value * mask_pair_chain, dim=-1)
+                / (torch.sum(mask_pair_chain, dim=-1) + 1e-5),
+                dim=1,
+            ).values
+        chain_pair_iptm[idx1] = chain_iptm
+
+    return ptm, iptm, ligand_iptm, protein_iptm, chain_pair_iptm
 
 
 def inject_dap_into_confidence(confidence_module):
@@ -652,21 +816,61 @@ def run_confidence_dap(
     # ══════════════════════════════════════════════════════════════════
 
     heads = conf.confidence_heads
+    heads_compute_dtype = _module_compute_dtype(heads)
 
-    # 3a. Compute PAE logits on z_chunk BEFORE gathering z (saves ~592 MB)
+    # 3a. Compute PAE on row chunks and gather only scalar expectations to rank 0 CPU.
+    z_heads_chunk = z_chunk.to(dtype=heads_compute_dtype)
+    n_res = mask.sum(dim=-1, keepdim=True).to(device=z_heads_chunk.device, dtype=torch.float32)
     if heads.use_separate_heads:
-        pae_intra_chunk = heads.to_pae_intra_logits(z_chunk)  # [B, N/dap, N, bins]
-        pae_inter_chunk = heads.to_pae_inter_logits(z_chunk)
-        # We'll apply intra/inter masks after gather (need full asym_id)
-        pae_intra_logits = gather(pae_intra_chunk.contiguous(), dim=1, original_size=N)
-        pae_inter_logits = gather(pae_inter_chunk.contiguous(), dim=1, original_size=N)
-        del pae_intra_chunk, pae_inter_chunk
+        pae_intra_chunk = heads.to_pae_intra_logits(z_heads_chunk)  # [B, N/dap, N, bins]
+        pae_inter_chunk = heads.to_pae_inter_logits(z_heads_chunk)
+        asym_id_full = feats_chunk.get("asym_id")
+        if asym_id_full is None:
+            if dap_rank == 0:
+                asym_id_full = feats["asym_id"].to(device=z_heads_chunk.device)
+            else:
+                asym_id_full = torch.empty(B, N, dtype=torch.float32, device=z_heads_chunk.device)
+            torch.distributed.broadcast(asym_id_full, src=0)
+        asym_id_rows_full = (
+            torch.nn.functional.pad(asym_id_full, (0, N_padded - N))
+            if N_padded != N
+            else asym_id_full
+        )
+        asym_id_rows = asym_id_rows_full[:, row_start:row_end]
+        is_same_chain_pae = asym_id_rows.unsqueeze(-1) == asym_id_full.unsqueeze(-2)
+        pae_intra_expected = _pae_expected_from_logits(pae_intra_chunk)
+        pae_intra_tm_expected = _pae_tm_expected_from_logits(pae_intra_chunk, n_res)
+        del pae_intra_chunk
+        pae_inter_expected = _pae_expected_from_logits(pae_inter_chunk)
+        pae_inter_tm_expected = _pae_tm_expected_from_logits(pae_inter_chunk, n_res)
+        del pae_inter_chunk
+        pae_expected_chunk = torch.where(
+            is_same_chain_pae, pae_intra_expected, pae_inter_expected
+        )
+        pae_tm_expected_chunk = torch.where(
+            is_same_chain_pae, pae_intra_tm_expected, pae_inter_tm_expected
+        )
+        del pae_intra_expected, pae_inter_expected
+        del pae_intra_tm_expected, pae_inter_tm_expected
+        del asym_id_rows_full, asym_id_rows, is_same_chain_pae
+        if "asym_id" not in feats_chunk:
+            del asym_id_full
     else:
-        pae_chunk = heads.to_pae_logits(z_chunk)  # [B, N/dap, N, 64]
-        pae_logits = gather(pae_chunk.contiguous(), dim=1, original_size=N)  # [B, N, N, 64]
+        pae_chunk = heads.to_pae_logits(z_heads_chunk)  # [B, N/dap, N, 64]
+        pae_expected_chunk = _pae_expected_from_logits(pae_chunk)
+        pae_tm_expected_chunk = _pae_tm_expected_from_logits(pae_chunk, n_res)
         del pae_chunk
+    del n_res, z_heads_chunk
+    pae = gather_to_rank0_cpu(
+        pae_expected_chunk.contiguous(), dim=1, original_size=N, root=0
+    )
+    pae_tm_expected = gather_to_rank0_cpu(
+        pae_tm_expected_chunk.contiguous(), dim=1, original_size=N, root=0
+    )
+    del pae_expected_chunk, pae_tm_expected_chunk
+    pae_logits = None
 
-    _cmem("PAE computed + gathered")
+    _cmem("PAE streamed to rank0 CPU")
 
     # Gather d_chunk → full d (collective, small)
     d_full = gather(d_chunk.contiguous(), dim=1, original_size=N)
@@ -691,34 +895,32 @@ def run_confidence_dap(
     if dap_rank == 0:
         from boltz.model.layers.confidence_utils import compute_aggregated_metric as _pde_expectation
 
-        pred_distogram_prob = torch.nn.functional.softmax(
-            pred_distogram_logits, dim=-1
-        ).repeat_interleave(multiplicity, 0)
-        contacts = torch.zeros(
-            (1, 1, 1, 64), dtype=pred_distogram_prob.dtype, device=pred_distogram_prob.device
+        contact_row_chunk = int(os.environ.get("BOLTZ_CONF_CONTACT_ROW_CHUNK", "128"))
+        prob_contact = _distogram_contact_prob_cpu(
+            pred_distogram_logits,
+            contact_bins=20,
+            row_chunk=contact_row_chunk,
         )
-        contacts[:, :, :, :20] = 1.0
-        prob_contact = (pred_distogram_prob * contacts).sum(-1)
-        token_pad_mask_m = feats["token_pad_mask"].repeat_interleave(multiplicity, 0)
+        if multiplicity > 1:
+            prob_contact = prob_contact.repeat_interleave(multiplicity, 0)
+        token_pad_mask_m = (
+            feats["token_pad_mask"].detach().cpu().repeat_interleave(multiplicity, 0)
+        )
+        eye = torch.eye(token_pad_mask_m.shape[1], device="cpu").unsqueeze(0)
         token_pad_pair_mask = (
             token_pad_mask_m.unsqueeze(-1)
             * token_pad_mask_m.unsqueeze(-2)
-            * (
-                1
-                - torch.eye(
-                    token_pad_mask_m.shape[1], device=token_pad_mask_m.device
-                ).unsqueeze(0)
-            )
+            * (1 - eye)
         )
         token_pair_mask = token_pad_pair_mask * prob_contact
-        asym_id_rep = feats["asym_id"].repeat_interleave(multiplicity, 0)
+        asym_id_rep = feats["asym_id"].detach().cpu().repeat_interleave(multiplicity, 0)
         token_interface_pair_mask = token_pair_mask * (
             asym_id_rep.unsqueeze(-1) != asym_id_rep.unsqueeze(-2)
         )
-        numer_pde = torch.zeros(B, device=pred_distogram_logits.device, dtype=torch.float32)
-        denom_pde = torch.zeros(B, device=pred_distogram_logits.device, dtype=torch.float32)
-        numer_ipde = torch.zeros(B, device=pred_distogram_logits.device, dtype=torch.float32)
-        denom_ipde = torch.zeros(B, device=pred_distogram_logits.device, dtype=torch.float32)
+        numer_pde = torch.zeros(B, device="cuda:0", dtype=torch.float32)
+        denom_pde = torch.zeros(B, device="cuda:0", dtype=torch.float32)
+        numer_ipde = torch.zeros(B, device="cuda:0", dtype=torch.float32)
+        denom_ipde = torch.zeros(B, device="cuda:0", dtype=torch.float32)
         _pde_stream_pin = bool(torch.cuda.is_available())
         pde_full_cpu = torch.empty((B, N, N), dtype=torch.float32, device="cpu", pin_memory=_pde_stream_pin)
         pde_logits_cpu_chunks = [] if keep_pde_logits else None
@@ -770,24 +972,32 @@ def run_confidence_dap(
         if dap_rank == 0:
             z_sym_chunk = z_row + z_col.permute(0, 2, 1, 3)
             del z_row, z_col
+            z_sym_heads = z_sym_chunk.to(dtype=heads_compute_dtype)
+            del z_sym_chunk
             if heads.use_separate_heads:
-                pde_intra_c = heads.to_pde_intra_logits(z_sym_chunk)
-                pde_inter_c = heads.to_pde_inter_logits(z_sym_chunk)
+                pde_intra_c = heads.to_pde_intra_logits(z_sym_heads)
+                pde_inter_c = heads.to_pde_inter_logits(z_sym_heads)
                 m_same = is_same_chain[:, r_start:r_end_col, :].unsqueeze(-1)
                 m_diff = is_different_chain[:, r_start:r_end_col, :].unsqueeze(-1)
                 pde_c = pde_intra_c * m_same + pde_inter_c * m_diff
                 del pde_intra_c, pde_inter_c, m_same, m_diff
             else:
-                pde_c = heads.to_pde_logits(z_sym_chunk)
-            del z_sym_chunk
+                pde_c = heads.to_pde_logits(z_sym_heads)
+            del z_sym_heads
             # On-the-fly: expected PDE scalar field + gPDE/giPDE (same formulas as confidencev2) without
             # full [B,N,N,bins] pde_logits on GPU; optional CPU chunks for logits if KEEP flag set.
             # Layout: pde_c is [B, j_block, i, bins]; torch.cat(..., dim=1) stacks j → equivalent to
             # pde_logits[b, j, i, :]. token_pair_mask is [b, i, j] so use pde_ij = pde_cm.permute(0,2,1).
             pde_cm = _pde_expectation(pde_c, end=32)
             pde_ij = pde_cm.float().permute(0, 2, 1)
-            m_blk = token_pair_mask[:, :, r_start:r_end_col].float()
-            iface_blk = token_interface_pair_mask[:, :, r_start:r_end_col].float()
+            m_blk = token_pair_mask[:, :, r_start:r_end_col].float().to(
+                device=pde_ij.device,
+                non_blocking=_pde_stream_pin,
+            )
+            iface_blk = token_interface_pair_mask[:, :, r_start:r_end_col].float().to(
+                device=pde_ij.device,
+                non_blocking=_pde_stream_pin,
+            )
             numer_pde += (pde_ij * m_blk).sum(dim=(1, 2))
             denom_pde += m_blk.sum(dim=(1, 2))
             numer_ipde += (pde_ij * iface_blk).sum(dim=(1, 2))
@@ -812,7 +1022,7 @@ def run_confidence_dap(
             if N_padded != N:
                 pde_logits = pde_logits[:, :N, :N, :].contiguous()
         # Masks / distogram prob only used inside chunked PDE; drop before 3c to free GB-scale GPU.
-        del pred_distogram_prob, prob_contact, token_pad_pair_mask, contacts
+        del prob_contact, token_pad_pair_mask
         del token_pair_mask, token_interface_pair_mask, asym_id_rep
     torch.distributed.barrier()
     _cmem("chunked PDE done")
@@ -826,29 +1036,18 @@ def run_confidence_dap(
             out_dict["s_conf"] = s
             out_dict["z_conf"] = None  # not kept to save memory
 
-        # Apply intra/inter masks for separate heads PAE (in-place: avoid intra+inter+out triple peak)
-        if heads.use_separate_heads:
-            asym_id_token = feats["asym_id"]
-            is_same_chain = asym_id_token.unsqueeze(-1) == asym_id_token.unsqueeze(-2)
-            is_different_chain = ~is_same_chain
-            m_same = is_same_chain.float().unsqueeze(-1)
-            m_diff = is_different_chain.float().unsqueeze(-1)
-            pae_intra_logits.mul_(m_same)
-            pae_intra_logits.addcmul_(pae_inter_logits, m_diff)
-            del pae_inter_logits
-            pae_logits = pae_intra_logits
-
         _cmem("PDE done")
 
         # s-only heads
-        resolved_logits = heads.to_resolved_logits(s)
-        plddt_logits = heads.to_plddt_logits(s)
+        s_heads = s.to(dtype=heads_compute_dtype)
+        resolved_logits = heads.to_resolved_logits(s_heads)
+        plddt_logits = heads.to_plddt_logits(s_heads)
+        del s_heads
 
         # ── Metric aggregation (from original ConfidenceHeads.forward) ──
         from boltz.data import const
         from boltz.model.layers.confidence_utils import (
             compute_aggregated_metric,
-            compute_ptms,
         )
 
         ligand_weight = 20
@@ -932,11 +1131,11 @@ def run_confidence_dap(
             complex_ipde=complex_ipde,
         ))
         out_dict["pae_logits"] = pae_logits
-        out_dict["pae"] = compute_aggregated_metric(pae_logits, end=32)
+        out_dict["pae"] = pae
 
         try:
-            ptm, iptm, ligand_iptm, protein_iptm, pair_chains_iptm = compute_ptms(
-                pae_logits, x_pred, feats, multiplicity
+            ptm, iptm, ligand_iptm, protein_iptm, pair_chains_iptm = _compute_ptms_from_tm_expected(
+                pae_tm_expected, x_pred, feats, multiplicity
             )
             out_dict["ptm"] = ptm
             out_dict["iptm"] = iptm

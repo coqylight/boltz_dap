@@ -97,6 +97,56 @@ def _gather(tensor: Tensor, dim: int = -1, original_size: int = None) -> Tensor:
     return output
 
 
+def _trim_dim(tensor: Tensor, dim: int, original_size: int | None) -> Tensor:
+    if original_size is None or tensor.shape[dim] <= original_size:
+        return tensor
+    indices = [slice(None)] * len(tensor.shape)
+    indices[dim] = slice(0, original_size)
+    return tensor[tuple(indices)]
+
+
+def _gather_to_rank0_cpu(
+    tensor: Tensor,
+    dim: int = -1,
+    original_size: int | None = None,
+    root: int = 0,
+    pin_memory: bool = False,
+) -> Tensor | None:
+    """Gather shards to ``root`` CPU memory without full-rank output tensors."""
+    dap_size = get_dap_size()
+    dap_rank = get_dap_rank()
+    if dap_size == 1:
+        output = _trim_dim(tensor.detach().cpu(), dim, original_size)
+        return output.pin_memory() if pin_memory else output
+
+    group = get_dap_group()
+    send_tensor = tensor.detach().contiguous()
+    output = None
+    if dap_rank == root:
+        shards = [None] * dap_size
+        shards[root] = send_tensor.cpu()
+        for src in range(dap_size):
+            if src == root:
+                continue
+            meta = torch.empty(1, dtype=torch.int64, device=send_tensor.device)
+            dist.recv(meta, src=src, group=group)
+            payload = torch.empty(
+                int(meta.item()), dtype=send_tensor.dtype, device=send_tensor.device
+            )
+            dist.recv(payload, src=src, group=group)
+            shards[src] = payload.reshape_as(send_tensor).cpu()
+        output = torch.cat(shards, dim=dim)
+        output = _trim_dim(output, dim, original_size)
+        if pin_memory:
+            output = output.pin_memory()
+    else:
+        payload = send_tensor.reshape(-1)
+        meta = torch.tensor([payload.numel()], dtype=torch.int64, device=send_tensor.device)
+        dist.send(meta, dst=root, group=group)
+        dist.send(payload, dst=root, group=group)
+    return output
+
+
 # Autograd-compatible wrappers with proper gradient handling
 
 class Copy(torch.autograd.Function):
@@ -247,6 +297,29 @@ def gather(input: Tensor, dim: int = -1, original_size: int = None) -> Tensor:
             output = output[tuple(indices)]
         return output
     return _gather(input, dim=dim, original_size=original_size)
+
+
+def gather_to_rank0_cpu(
+    input: Tensor,
+    dim: int = -1,
+    original_size: int = None,
+    root: int = 0,
+    pin_memory: bool = False,
+) -> Tensor | None:
+    """Gather tensor shards to root CPU memory only.
+
+    This is for inference-only memory exits where non-root ranks must
+    participate in communication but must not allocate the reconstructed tensor.
+    """
+    if torch.is_grad_enabled() and input.requires_grad:
+        raise RuntimeError("gather_to_rank0_cpu is inference-only")
+    return _gather_to_rank0_cpu(
+        input,
+        dim=dim,
+        original_size=original_size,
+        root=root,
+        pin_memory=pin_memory,
+    )
 
 
 def col_to_row(input: Tensor) -> Tensor:

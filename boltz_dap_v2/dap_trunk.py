@@ -27,13 +27,230 @@ import os
 # Late-imported in _run_template_dap when dap_size > 1
 # from dap_tri_att import DAPTriAttStart, DAPTriAttEnd
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
-from boltz_distributed.comm import scatter, gather, row_to_col, col_to_row
+from boltz_distributed.comm import (
+    scatter,
+    gather,
+    gather_to_rank0_cpu,
+    row_to_col,
+    col_to_row,
+)
 from boltz_distributed.core import get_dap_size, get_dap_rank
 
 from dap_msa import DAPMSALayer
 from dap_pairformer import DAPPairformerLayer
+from dap_dtype_guard import (
+    ensure_bf16_row_to_col_input,
+    get_pair_storage_dtype,
+    restore_pair_storage_dtype,
+)
 from dap_pairformer_noseq import DAPPairformerNoSeqLayer
 from dap_confidence import inject_dap_into_confidence, run_confidence_dap
+
+
+def _env_positive_int(name: str) -> Optional[int]:
+    raw = os.environ.get(name, "").strip()
+    if raw == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _tri_attn_chunk_size(n_tokens: int, *, default_long: int, default_small: int) -> int:
+    override = _env_positive_int("BOLTZ_TRI_ATT_CHUNK")
+    if override is not None:
+        return override
+    if n_tokens >= 8000:
+        return 2
+    if n_tokens > 2000:
+        return default_long
+    return default_small
+
+
+def _module_compute_dtype(module: nn.Module) -> torch.dtype:
+    """Use the wrapped module parameter dtype for non-DAP pointwise ops."""
+    param = next(module.parameters(), None)
+    return param.dtype if param is not None else torch.float32
+
+
+def _stream_distogram_channel_from_cpu(
+    distogram_module: nn.Module,
+    z_cpu: Tensor,
+    *,
+    channel: int = 0,
+    row_chunk: int = 128,
+) -> Tensor:
+    """Compute one distogram channel from CPU z using bounded GPU row chunks."""
+    if z_cpu.device.type != "cpu":
+        raise ValueError("z_cpu must be a CPU tensor")
+
+    weight = distogram_module.distogram.weight.detach().cpu()
+    bias = distogram_module.distogram.bias.detach().cpu()
+    num_bins = distogram_module.num_bins
+    num_distograms = getattr(distogram_module, "num_distograms", 1)
+    compute_dtype = weight.dtype
+    B, N, _, _D = z_cpu.shape
+    out = torch.empty(B, N, N, num_bins, dtype=compute_dtype, device="cpu")
+    flat_start = channel * num_bins
+    flat_end = flat_start + num_bins
+
+    use_cuda = torch.cuda.is_available()
+    if use_cuda:
+        weight_dev = weight[flat_start:flat_end].cuda()
+        bias_dev = bias[flat_start:flat_end].cuda()
+        device = "cuda"
+    else:
+        weight_dev = weight[flat_start:flat_end]
+        bias_dev = bias[flat_start:flat_end]
+        device = "cpu"
+
+    row_chunk = max(1, row_chunk)
+    for row_start in range(0, N, row_chunk):
+        row_end = min(row_start + row_chunk, N)
+        z_rows = z_cpu[:, row_start:row_end].to(device=device, dtype=compute_dtype)
+        z_cols = z_cpu[:, :, row_start:row_end].transpose(1, 2).to(
+            device=device, dtype=compute_dtype
+        )
+        logits = torch.nn.functional.linear(z_rows + z_cols, weight_dev, bias_dev)
+        out[:, row_start:row_end].copy_(logits.cpu())
+        del z_rows, z_cols, logits
+        if use_cuda:
+            torch.cuda.empty_cache()
+
+    if num_distograms == 1:
+        return out
+    return out
+
+
+def _module_device(module: nn.Module) -> torch.device:
+    param = next(module.parameters(), None)
+    if param is not None:
+        return param.device
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _stream_pairwise_conditioning_to_cpu(
+    pairwise_conditioner: nn.Module,
+    z_cpu: Tensor,
+    relative_position_encoding_cpu: Tensor,
+    *,
+    row_chunk: int,
+    pin_memory: bool = False,
+) -> Tensor:
+    """Run pairwise conditioning by rows and keep the full output on CPU."""
+    if z_cpu.device.type != "cpu":
+        raise ValueError("z_cpu must be a CPU tensor")
+    if relative_position_encoding_cpu.device.type != "cpu":
+        raise ValueError("relative_position_encoding_cpu must be a CPU tensor")
+
+    device = _module_device(pairwise_conditioner)
+    use_cuda = device.type == "cuda"
+    pw_compute_dtype = _module_compute_dtype(
+        pairwise_conditioner.dim_pairwise_init_proj
+    )
+    B, N, _, z_dim = z_cpu.shape
+    rel_dim = relative_position_encoding_cpu.shape[-1]
+
+    probe_in = torch.zeros(
+        1,
+        1,
+        1,
+        z_dim + rel_dim,
+        dtype=pw_compute_dtype,
+        device=device,
+    )
+    probe_out = pairwise_conditioner.dim_pairwise_init_proj(probe_in)
+    out_dim = probe_out.shape[-1]
+    out_dtype = probe_out.dtype
+    del probe_in, probe_out
+
+    z_cond_cpu = torch.empty(
+        B,
+        N,
+        N,
+        out_dim,
+        dtype=out_dtype,
+        device="cpu",
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+    row_chunk = max(1, int(row_chunk))
+    for row_start in range(0, N, row_chunk):
+        row_end = min(row_start + row_chunk, N)
+        chunk_in = torch.cat(
+            (
+                z_cpu[:, row_start:row_end],
+                relative_position_encoding_cpu[:, row_start:row_end],
+            ),
+            dim=-1,
+        ).to(device=device, dtype=pw_compute_dtype)
+        chunk_out = pairwise_conditioner.dim_pairwise_init_proj(chunk_in)
+        del chunk_in
+        for transition in pairwise_conditioner.transitions:
+            chunk_out = transition(chunk_out) + chunk_out
+        z_cond_cpu[:, row_start:row_end].copy_(
+            chunk_out.cpu(), non_blocking=use_cuda
+        )
+        del chunk_out
+        if use_cuda:
+            torch.cuda.empty_cache()
+
+    return z_cond_cpu
+
+
+def _stream_token_trans_bias_from_cpu(
+    layers: nn.ModuleList,
+    z_cond_cpu: Tensor,
+    *,
+    row_chunk: int,
+    pin_memory: bool = False,
+) -> Tensor:
+    """Project CPU-backed z_cond into token transformer bias by row chunks."""
+    if z_cond_cpu.device.type != "cpu":
+        raise ValueError("z_cond_cpu must be a CPU tensor")
+    if len(layers) == 0:
+        raise ValueError("layers must not be empty")
+
+    device = _module_device(layers[0])
+    use_cuda = device.type == "cuda"
+    compute_dtype = _module_compute_dtype(layers[0])
+    B, N, _, out_dim = z_cond_cpu.shape
+
+    probe_in = torch.zeros(1, 1, 1, out_dim, dtype=compute_dtype, device=device)
+    probe_out = layers[0](probe_in)
+    per_layer_dim = probe_out.shape[-1]
+    bias_dtype = probe_out.dtype
+    del probe_in, probe_out
+
+    token_trans_bias_cpu = torch.empty(
+        B,
+        N,
+        N,
+        len(layers) * per_layer_dim,
+        dtype=bias_dtype,
+        device="cpu",
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+    row_chunk = max(1, int(row_chunk))
+    for row_start in range(0, N, row_chunk):
+        row_end = min(row_start + row_chunk, N)
+        z_chunk = z_cond_cpu[:, row_start:row_end].to(
+            device=device,
+            dtype=compute_dtype,
+            non_blocking=use_cuda,
+        )
+        bias_gpu = torch.cat([layer(z_chunk) for layer in layers], dim=-1)
+        token_trans_bias_cpu[:, row_start:row_end].copy_(
+            bias_gpu.cpu(), non_blocking=use_cuda
+        )
+        del bias_gpu, z_chunk
+        if use_cuda:
+            torch.cuda.empty_cache()
+
+    return token_trans_bias_cpu
 
 
 def _run_atom_encoder_with_chunked_zcond(ae, feats, s_trunk, z_cond, chunk_rows: int):
@@ -47,7 +264,8 @@ def _run_atom_encoder_with_chunked_zcond(ae, feats, s_trunk, z_cond, chunk_rows:
     Parameters
     ----------
     z_cond
-        Pairwise conditioning ``[B, Nt, Nt, tz]`` on CUDA (same ``B``/``Nt`` as trunk).
+        Pairwise conditioning ``[B, Nt, Nt, tz]``. May be CPU-backed; row chunks
+        are moved to the atom encoder device on demand.
     chunk_rows
         Token row chunk size; reuse ``BOLTZ_DC_ATOM_ENCODER_CHUNK`` in the caller.
     """
@@ -151,7 +369,11 @@ def _run_atom_encoder_with_chunked_zcond(ae, feats, s_trunk, z_cond, chunk_rows:
             cr = max(1, int(chunk_rows))
             for i0 in range(0, Nt, cr):
                 i1 = min(i0 + cr, Nt)
-                z_chunk = z_cond[:, i0:i1]
+                z_chunk = z_cond[:, i0:i1].to(
+                    device=p.device,
+                    dtype=torch.float32,
+                    non_blocking=z_cond.device.type == "cpu" and p.device.type == "cuda",
+                )
                 z_row = ztp(z_chunk.float())
                 Qc = atom_to_token_queries[:, :, :, i0:i1]
                 p_z_acc.add_(
@@ -253,6 +475,14 @@ def _zs_checkpoint(label, z_scattered, s, original_N):
     """
     dap_rank = get_dap_rank()
     dap_size = get_dap_size()
+    save_trunk_ckpt = os.environ.get("BOLTZ_SAVE_TRUNK_CKPT", "1") == "1"
+
+    # Full-z gather is only needed for debug checkpoint artifacts. When disabled,
+    # skip this path entirely to avoid large temporary allocations on big systems.
+    if not save_trunk_ckpt:
+        if dap_rank == 0:
+            print(f"    [CKP] [{label}] skipped full-z gather (BOLTZ_SAVE_TRUNK_CKPT=0)")
+        return None
     
     if dap_size > 1:
         N_padded = ((original_N + dap_size - 1) // dap_size) * dap_size
@@ -383,6 +613,7 @@ def _make_dap_forward(model):
             original_N = s_inputs.shape[1]
             split_size = (original_N + dap_size - 1) // dap_size
             N_padded = split_size * dap_size
+            pair_storage_dtype = get_pair_storage_dtype()
             row_start = dap_rank * split_size
             row_end = min(row_start + split_size, original_N)
             local_rows = row_end - row_start
@@ -531,6 +762,9 @@ def _make_dap_forward(model):
 
             # Sub-checkpoint: z after contact_conditioning (= full z_init)
             _checkpoints["sub/z_after_contact_cond"] = _zs_checkpoint("sub/z_after_contact_cond", z_init_scattered, s_init, original_N)
+            z_init_scattered = restore_pair_storage_dtype(
+                z_init_scattered, dtype=pair_storage_dtype
+            )
 
             # Initialize recycling tensors as SCATTERED
             s = torch.zeros_like(s_init)
@@ -557,8 +791,13 @@ def _make_dap_forward(model):
 
                         # Recycling: s is full (small), z stays scattered
                         s = s_init + model.s_recycle(model.s_norm(s))
-                        z_scattered = z_init_scattered + model.z_recycle(
-                            model.z_norm(z_scattered)
+                        z_recycle_in = model.z_norm(
+                            z_scattered.to(dtype=_module_compute_dtype(model.z_norm))
+                        )
+                        z_scattered = z_init_scattered + model.z_recycle(z_recycle_in)
+                        del z_recycle_in
+                        z_scattered = restore_pair_storage_dtype(
+                            z_scattered, dtype=pair_storage_dtype
                         )
 
                         cp = _zs_checkpoint(f"R{i}/after_recycle", z_scattered, s, original_N)
@@ -573,6 +812,9 @@ def _make_dap_forward(model):
                                 tmpl, z_scattered, feats, pair_mask,
                                 model.use_kernels, original_N, _mem_log,
                                 recycle_idx=i,
+                            )
+                            z_scattered = restore_pair_storage_dtype(
+                                z_scattered, dtype=pair_storage_dtype
                             )
                             _mem_log("after template_module")
 
@@ -589,6 +831,9 @@ def _make_dap_forward(model):
                             msa = msa._orig_mod
 
                         _save_gran_ckpt = os.environ.get("BOLTZ_SAVE_GRAN_CKPT", "1") == "1"
+                        z_scattered = restore_pair_storage_dtype(
+                            z_scattered, dtype=pair_storage_dtype
+                        )
                         z_before_msa = z_scattered
                         z_msa_out = _run_msa_dap(
                             msa, z_scattered, s_inputs, feats,
@@ -609,6 +854,9 @@ def _make_dap_forward(model):
 
                         z_scattered = z_before_msa + z_msa_out
                         del z_before_msa, z_msa_out
+                        z_scattered = restore_pair_storage_dtype(
+                            z_scattered, dtype=pair_storage_dtype
+                        )
                         _mem_log("after msa_module")
 
                         cp = _zs_checkpoint(f"R{i}/after_msa", z_scattered, s, original_N)
@@ -644,6 +892,9 @@ def _make_dap_forward(model):
                             model.use_kernels,
                             mem_log=_mem_log
                         )
+                        z_scattered = restore_pair_storage_dtype(
+                            z_scattered, dtype=pair_storage_dtype
+                        )
                         _mem_log("after pairformer_module")
 
                         cp = _zs_checkpoint(f"R{i}/after_pairformer", z_scattered, s, original_N)
@@ -666,48 +917,47 @@ def _make_dap_forward(model):
                 torch.cuda.empty_cache()
                 _mem_log("after trunk offload to CPU")
 
-                # ── GATHER z back to full and TRIM to original_N ──
-                z = gather(z_scattered.contiguous(), dim=1, original_size=N_padded)
-                del z_scattered
-                _mem_log("after gather z (full z restored)")
-                # Trim padding back to original sequence length
-                if N_padded != original_N:
-                    z = z[:, :original_N, :original_N, :]
+            # ── Gather z to rank 0 CPU only ────────────────────────────────
+            # Only rank 0 needs full z after the DAP trunk. Avoid all_gather,
+            # which reconstructs full z on every rank and OOMs for N=8712.
+            z_cpu = gather_to_rank0_cpu(
+                z_scattered.contiguous(),
+                dim=1,
+                original_size=N_padded,
+                root=0,
+            )
+            del z_scattered
+            if dap_rank == 0 and N_padded != original_N:
+                z_cpu = z_cpu[:, :original_N, :original_N, :]
+            torch.cuda.empty_cache()
+            _mem_log("after rank0 CPU gather z")
 
-                # Non-rank-0 GPUs: free the full z immediately
-                # (only rank 0 needs it for post-trunk modules)
-                if dap_rank != 0:
-                    del z
-                    z = None
-                    torch.cuda.empty_cache()
-
-                # Save checkpoints only when explicitly enabled; these artifacts are
-                # very large and not needed for normal inference runs.
-                _save_trunk_ckpt = os.environ.get("BOLTZ_SAVE_TRUNK_CKPT", "1") == "1"
-                if dap_rank == 0 and _save_trunk_ckpt:
-                    import os as _os
-                    _out_dir = _os.environ.get('BOLTZ_OUT_DIR', '')
-                    if _out_dir:
-                        _ckpt_path = _os.path.join(_out_dir, 'trunk_checkpoints.pt')
-                        torch.save(_checkpoints, _ckpt_path)
-                        _ckpt_size = _os.path.getsize(_ckpt_path) / (1024**2)
-                        print(f"    [CKP] Saved {len(_checkpoints)} full-tensor checkpoints to {_ckpt_path} ({_ckpt_size:.0f} MB)")
+            # Save checkpoints only when explicitly enabled; these artifacts are
+            # very large and not needed for normal inference runs.
+            _save_trunk_ckpt = os.environ.get("BOLTZ_SAVE_TRUNK_CKPT", "1") == "1"
+            if dap_rank == 0 and _save_trunk_ckpt:
+                import os as _os
+                _out_dir = _os.environ.get('BOLTZ_OUT_DIR', '')
+                if _out_dir:
+                    _ckpt_path = _os.path.join(_out_dir, 'trunk_checkpoints.pt')
+                    torch.save(_checkpoints, _ckpt_path)
+                    _ckpt_size = _os.path.getsize(_ckpt_path) / (1024**2)
+                    print(f"    [CKP] Saved {len(_checkpoints)} full-tensor checkpoints to {_ckpt_path} ({_ckpt_size:.0f} MB)")
 
             if dap_rank == 0:
-                pdistogram = model.distogram_module(z)
-                dict_out = {"pdistogram": pdistogram, "s": s}
+                dist_row_chunk = int(os.environ.get("BOLTZ_DISTOGRAM_ROW_CHUNK", "128"))
+                conf_pdist = _stream_distogram_channel_from_cpu(
+                    model.distogram_module,
+                    z_cpu,
+                    channel=0,
+                    row_chunk=dist_row_chunk,
+                )
+                dict_out = {"pdistogram": conf_pdist[:, :, :, None, :], "s": s}
 
                 # Offload distogram after use
                 model.distogram_module.cpu()
                 torch.cuda.empty_cache()
-                _mem_log("after distogram (offloaded)")
-
-                # Move z to CPU BEFORE diffusion_conditioning to free ~5.5GB
-                # (z_cond = cat(z, rel_pos) would need ~11GB extra on GPU)
-                z_cpu = z.cpu()
-                del z
-                torch.cuda.empty_cache()
-                _mem_log("after z offloaded to CPU")
+                _mem_log("after streamed distogram channel (offloaded)")
             else:
                 dict_out = {"s": s}
 
@@ -731,34 +981,18 @@ def _make_dap_forward(model):
                     N = z_cpu.shape[1]
                     chunk_size = int(os.environ.get("BOLTZ_DC_PAIRWISE_CHUNK", "512"))
 
-                    # Allocate output z_cond on GPU
-                    # Determine output dim by probing with a small tensor
-                    _probe_in = torch.zeros(1, 1, 1, z_cpu.shape[-1] + relative_position_encoding.shape[-1],
-                                           dtype=z_cpu.dtype, device="cuda")
-                    _probe_out = pw.dim_pairwise_init_proj(_probe_in)
-                    out_dim = _probe_out.shape[-1]
-                    del _probe_in, _probe_out
-                    z_cond = torch.empty(1, N, N, out_dim, dtype=z_cpu.dtype, device="cuda")
-
-                    for row_start in range(0, N, chunk_size):
-                        row_end = min(row_start + chunk_size, N)
-                        # Slice z_cpu and rel_pos on CPU, concat, move chunk to GPU
-                        chunk_in = torch.cat(
-                            (z_cpu[:, row_start:row_end],
-                             relative_position_encoding[:, row_start:row_end]),
-                            dim=-1
-                        ).cuda()
-                        chunk_out = pw.dim_pairwise_init_proj(chunk_in)
-                        del chunk_in
-                        # Apply transitions in-place per chunk
-                        for transition in pw.transitions:
-                            chunk_out = transition(chunk_out) + chunk_out
-                        z_cond[:, row_start:row_end] = chunk_out
-                        del chunk_out
+                    _pin = bool(torch.cuda.is_available())
+                    z_cond_cpu = _stream_pairwise_conditioning_to_cpu(
+                        pw,
+                        z_cpu,
+                        relative_position_encoding,
+                        row_chunk=chunk_size,
+                        pin_memory=False,
+                    )
 
                     del relative_position_encoding  # Free CPU tensor
                     torch.cuda.empty_cache()
-                    _mem_log("  dc: after pairwise_conditioner (row-chunked)")
+                    _mem_log("  dc: after pairwise_conditioner (CPU-backed row-chunked)")
 
                     # Offload pairwise_conditioner weights — no longer needed
                     pw.cpu()
@@ -769,37 +1003,13 @@ def _make_dap_forward(model):
                     # 24 projections of z_cond [B,N,N,128]→[B,N,N,8] each, cat to [B,N,N,192]
                     _mem_log("  dc: before token_trans_bias")
                     layers = dc.token_trans_proj_z
-                    n_layers = len(layers)
-                    # Probe output dim per layer
-                    _p_in = torch.zeros(1, 1, 1, out_dim, dtype=z_cond.dtype, device="cuda")
-                    _p_out = layers[0](_p_in)
-                    per_layer_dim = _p_out.shape[-1]
-                    del _p_in, _p_out
-                    total_bias_dim = n_layers * per_layer_dim
-
-                    # Stream rows to CPU — avoids a full [1,N,N,total_bias_dim] GPU alloc
-                    # (that tensor dominated peak VRAM with large N).
-                    _pin = bool(torch.cuda.is_available())
-                    token_trans_bias_cpu = torch.empty(
-                        1,
-                        N,
-                        N,
-                        total_bias_dim,
-                        dtype=z_cond.dtype,
-                        device="cpu",
-                        pin_memory=_pin,
-                    )
                     chunk_size_ttb = int(os.environ.get("BOLTZ_DC_TOKEN_BIAS_CHUNK", "256"))
-                    for row_start in range(0, N, chunk_size_ttb):
-                        row_end = min(row_start + chunk_size_ttb, N)
-                        z_chunk = z_cond[:, row_start:row_end]
-                        bias_gpu = torch.cat(
-                            [layer(z_chunk) for layer in layers], dim=-1
-                        )
-                        token_trans_bias_cpu[:, row_start:row_end].copy_(
-                            bias_gpu, non_blocking=_pin
-                        )
-                        del bias_gpu, z_chunk
+                    token_trans_bias_cpu = _stream_token_trans_bias_from_cpu(
+                        layers,
+                        z_cond_cpu,
+                        row_chunk=chunk_size_ttb,
+                        pin_memory=False,
+                    )
                     _mem_log("  dc: after token_trans_bias (row-chunked, streamed to CPU)")
 
                     # Offload token_trans_proj_z weights
@@ -824,9 +1034,9 @@ def _make_dap_forward(model):
                     ae = dc.atom_encoder
                     chunk_ae = max(1, int(os.environ.get("BOLTZ_DC_ATOM_ENCODER_CHUNK", "256")))
                     q, c, p, to_keys = _run_atom_encoder_with_chunked_zcond(
-                        ae, feats, s, z_cond, chunk_ae
+                        ae, feats, s, z_cond_cpu, chunk_ae
                     )
-                    del z_cond
+                    del z_cond_cpu
                     torch.cuda.empty_cache()
                     _mem_log("  dc: after atom_encoder")
 
@@ -1074,8 +1284,6 @@ def _make_dap_forward(model):
                         # Grab conf-specific data before offloading dict_out
                         if dap_rank == 0:
                             conf_x_pred = dict_out.get("sample_atom_coords", feats["coords"])
-                            # .contiguous() on [B,N,N] slice (9 MB) so full pdistogram
-                            # [B,N,N,64] (590 MB) can be freed by CPU offload
                             conf_pdist = dict_out["pdistogram"][:, :, :, 0].contiguous()
                         else:
                             conf_x_pred = torch.empty(0)
@@ -1207,6 +1415,14 @@ def _run_template_dap(tmpl_module, z_scattered, feats, pair_mask, use_kernels, o
 
     B, T = res_type.shape[:2]
     N = original_N
+    pair_storage_dtype = get_pair_storage_dtype()
+    z_scattered = restore_pair_storage_dtype(
+        z_scattered, dtype=pair_storage_dtype
+    )
+
+    def _first_param_dtype(module):
+        param = next(module.parameters(), None)
+        return param.dtype if param is not None else torch.float32
 
     if mem_log:
         mem_log("  template: loaded per-residue features")
@@ -1318,7 +1534,9 @@ def _run_template_dap(tmpl_module, z_scattered, feats, pair_mask, use_kernels, o
     # z_scattered is [B, N/dap, N_padded, D]. Trim to original_N for template ops
     # and project: z_proj(z_norm(z_scattered[:,None])) → [B, 1, N/dap, N, template_dim]
     z_for_tmpl = z_scattered[:, :, :original_N, :]  # [B, N/dap, N, D]
+    z_for_tmpl = z_for_tmpl.to(dtype=_first_param_dtype(tmpl_module.z_norm))
     z_proj_out = tmpl_module.z_proj(tmpl_module.z_norm(z_for_tmpl[:, None]))
+    del z_for_tmpl
 
     if mem_log:
         mem_log("  template: z_proj computed")
@@ -1334,6 +1552,9 @@ def _run_template_dap(tmpl_module, z_scattered, feats, pair_mask, use_kernels, o
         del _zp_full, _zp_bt
 
     v = z_proj_out + a_tij
+    # Keep the template pairformer residual stream in bf16 so DAP all-to-all
+    # buffers match the same storage invariant used by the main pairformer.
+    v = restore_pair_storage_dtype(v, dtype=pair_storage_dtype)
     del a_tij, z_proj_out
 
     # Log v_input stats (debug only)
@@ -1371,7 +1592,11 @@ def _run_template_dap(tmpl_module, z_scattered, feats, pair_mask, use_kernels, o
         if original_N > const.chunk_size_threshold:
             # For very long sequences, use even smaller chunks to prevent OOM
             # Q@K^T shape: [chunk, H, N, N] × 4 bytes
-            chunk_size_tri_attn = 8 if original_N > 2000 else 32
+            chunk_size_tri_attn = _tri_attn_chunk_size(
+                original_N,
+                default_long=8,
+                default_small=32,
+            )
         else:
             chunk_size_tri_attn = 128
     else:
@@ -1393,6 +1618,10 @@ def _run_template_dap(tmpl_module, z_scattered, feats, pair_mask, use_kernels, o
         del _full
 
     for _li, layer in enumerate(tmpl_module.pairformer.layers):
+        pf_storage_dtype = pair_storage_dtype
+        pf_input = restore_pair_storage_dtype(
+            pf_input, dtype=pf_storage_dtype
+        )
         # IMPORTANT: Force use_kernels=False so both 1-GPU (original layers)
         # and 2-GPU (DAP-wrapped layers) use the same PyTorch-native code path.
         _tmpl_use_kernels = False
@@ -1403,12 +1632,18 @@ def _run_template_dap(tmpl_module, z_scattered, feats, pair_mask, use_kernels, o
         pf_input = pf_input + dropout * layer.tri_mul_out(
             pf_input, mask=pair_mask_tmpl, use_kernels=_tmpl_use_kernels
         )
+        pf_input = restore_pair_storage_dtype(
+            pf_input, dtype=pf_storage_dtype
+        )
         if mem_log:
             mem_log(f"  template: PF[{_li}] after tri_mul_out")
         _save_subop_gather("after_tri_mul_out", pf_input, _li)
 
         # 2. tri_mul_in — needs row_to_col transpose for DAP
         if dap_size > 1:
+            ensure_bf16_row_to_col_input(
+                pf_input, tag="template_pairformer.tri_mul_in", rank=dap_rank
+            )
             z_col = row_to_col(pf_input)
             pair_mask_col = row_to_col(pair_mask_tmpl.unsqueeze(-1)).squeeze(-1)
             # Zero out padded positions
@@ -1420,14 +1655,23 @@ def _run_template_dap(tmpl_module, z_scattered, feats, pair_mask, use_kernels, o
             z_col = z_col + dropout * layer.tri_mul_in(
                 z_col, mask=pair_mask_col, use_kernels=_tmpl_use_kernels
             )
+            z_col = restore_pair_storage_dtype(
+                z_col, dtype=pf_storage_dtype
+            )
             pf_input = col_to_row(z_col)
             del z_col
             if pf_input.shape[2] > original_N:
                 pf_input = pf_input[:, :, :original_N, :]
+            pf_input = restore_pair_storage_dtype(
+                pf_input, dtype=pf_storage_dtype
+            )
         else:
             dropout = _pfnoseq_dropout(layer.dropout, pf_input, layer.training)
             pf_input = pf_input + dropout * layer.tri_mul_in(
                 pf_input, mask=pair_mask_tmpl, use_kernels=_tmpl_use_kernels
+            )
+            pf_input = restore_pair_storage_dtype(
+                pf_input, dtype=pf_storage_dtype
             )
         if mem_log:
             mem_log(f"  template: PF[{_li}] after tri_mul_in")
@@ -1439,6 +1683,9 @@ def _run_template_dap(tmpl_module, z_scattered, feats, pair_mask, use_kernels, o
             pf_input, mask=pair_mask_tmpl, chunk_size=chunk_size_tri_attn,
             use_kernels=_tmpl_use_kernels,
         )
+        pf_input = restore_pair_storage_dtype(
+            pf_input, dtype=pf_storage_dtype
+        )
         if mem_log:
             mem_log(f"  template: PF[{_li}] after tri_att_start")
         _save_subop_gather("after_tri_att_start", pf_input, _li)
@@ -1449,12 +1696,29 @@ def _run_template_dap(tmpl_module, z_scattered, feats, pair_mask, use_kernels, o
             pf_input, mask=pair_mask_tmpl, chunk_size=chunk_size_tri_attn,
             use_kernels=_tmpl_use_kernels,
         )
+        pf_input = restore_pair_storage_dtype(
+            pf_input, dtype=pf_storage_dtype
+        )
         if mem_log:
             mem_log(f"  template: PF[{_li}] after tri_att_end")
         _save_subop_gather("after_tri_att_end", pf_input, _li)
 
         # 5. transition_z
-        pf_input = pf_input + layer.transition_z(pf_input)
+        _transition_storage_dtype = pf_input.dtype
+        _transition_compute_dtype = _first_param_dtype(layer.transition_z)
+        _transition_chunk_size = 64 if not layer.training else None
+        _transition_out = layer.transition_z(
+            pf_input.to(dtype=_transition_compute_dtype),
+            _transition_chunk_size,
+        )
+        _transition_out = restore_pair_storage_dtype(
+            _transition_out, dtype=_transition_storage_dtype
+        )
+        pf_input = pf_input + _transition_out
+        del _transition_out
+        pf_input = restore_pair_storage_dtype(
+            pf_input, dtype=pf_storage_dtype
+        )
         if mem_log:
             mem_log(f"  template: PF[{_li}] after transition")
         _save_subop_gather("after_transition", pf_input, _li)
@@ -1474,6 +1738,7 @@ def _run_template_dap(tmpl_module, z_scattered, feats, pair_mask, use_kernels, o
     # v = v + pf_output (residual)
     v = v + pf_input
     del pf_input
+    v = restore_pair_storage_dtype(v, dtype=pair_storage_dtype)
 
     if mem_log:
         mem_log("  template: PF residual added")
@@ -1489,7 +1754,10 @@ def _run_template_dap(tmpl_module, z_scattered, feats, pair_mask, use_kernels, o
         del _vr_full
 
     # Post-PF: norm, reshape, aggregate over templates
-    v = tmpl_module.v_norm(v)
+    _v_storage_dtype = v.dtype
+    _v_compute_dtype = _first_param_dtype(tmpl_module.v_norm)
+    v = tmpl_module.v_norm(v.to(dtype=_v_compute_dtype))
+    v = restore_pair_storage_dtype(v, dtype=_v_storage_dtype)
     v = v.view(B, T, *v.shape[1:])  # [B, T, N/dap, N, template_dim]
 
     # Granular: v_norm (debug only)
@@ -1504,6 +1772,7 @@ def _run_template_dap(tmpl_module, z_scattered, feats, pair_mask, use_kernels, o
     ntemplates = num_templates[:, None, None, None]
     u = (v * tmask).sum(dim=1) / ntemplates.to(v)  # [B, N/dap, N, template_dim]
     del v
+    u = restore_pair_storage_dtype(u, dtype=pair_storage_dtype)
 
     if mem_log:
         mem_log("  template: aggregated over templates")
@@ -1519,7 +1788,10 @@ def _run_template_dap(tmpl_module, z_scattered, feats, pair_mask, use_kernels, o
         del _u_full
 
     # Project back to z dim
-    u = tmpl_module.u_proj(tmpl_module.relu(u))  # [B, N/dap, N, token_z]
+    _u_storage_dtype = u.dtype
+    _u_compute_dtype = _first_param_dtype(tmpl_module.u_proj)
+    u = tmpl_module.u_proj(tmpl_module.relu(u.to(dtype=_u_compute_dtype)))  # [B, N/dap, N, token_z]
+    u = restore_pair_storage_dtype(u, dtype=_u_storage_dtype)
 
     if mem_log:
         mem_log("  template: u_proj computed")
@@ -1538,10 +1810,17 @@ def _run_template_dap(tmpl_module, z_scattered, feats, pair_mask, use_kernels, o
     if u.shape[2] < z_scattered.shape[2]:
         pad_n = z_scattered.shape[2] - u.shape[2]
         u = torch.nn.functional.pad(u, (0, 0, 0, pad_n))
+    u = restore_pair_storage_dtype(u, dtype=pair_storage_dtype)
+    z_scattered = restore_pair_storage_dtype(
+        z_scattered, dtype=pair_storage_dtype
+    )
 
     # Add to z_scattered
     z_scattered = z_scattered + u
     del u
+    z_scattered = restore_pair_storage_dtype(
+        z_scattered, dtype=pair_storage_dtype
+    )
 
     if mem_log:
         mem_log("  template: added to z_scattered")
@@ -1570,6 +1849,11 @@ def _run_msa_dap(msa_module, z_scattered, s_inputs, feats, full_pair_mask, use_k
 
     z_scattered: [B, N/dap, N, D]
     """
+    pair_storage_dtype = get_pair_storage_dtype()
+    z_scattered = restore_pair_storage_dtype(
+        z_scattered, dtype=pair_storage_dtype
+    )
+
     # Set chunk sizes (same logic as original, with OOM-safe overrides)
     N = z_scattered.shape[2]  # full N
     if not msa_module.training:
@@ -1581,7 +1865,11 @@ def _run_msa_dap(msa_module, z_scattered, s_inputs, feats, full_pair_mask, use_k
             chunk_size_outer_product = 4
             # For very long sequences, reduce tri_att chunk to prevent
             # Q@K^T score matrix OOM: [chunk, H, N, N] × 4 bytes
-            chunk_size_tri_attn = 16 if N > 2000 else 128
+            chunk_size_tri_attn = _tri_attn_chunk_size(
+                N,
+                default_long=16,
+                default_small=128,
+            )
         else:
             chunk_heads_pwa = False
             chunk_size_transition_z = None
@@ -1612,7 +1900,19 @@ def _run_msa_dap(msa_module, z_scattered, s_inputs, feats, full_pair_mask, use_k
         m = torch.cat([msa, has_deletion, deletion_value], dim=-1)
 
     if msa_module.subsample_msa:
-        msa_indices = torch.randperm(msa.shape[1])[:msa_module.num_subsampled_msa]
+        # Keep MSA subsampling identical across ranks to preserve DAP math parity.
+        num_msa = msa.shape[1]
+        num_pick = min(msa_module.num_subsampled_msa, num_msa)
+        if get_dap_size() > 1:
+            import torch.distributed as _tdist
+
+            if get_dap_rank() == 0:
+                msa_indices = torch.randperm(num_msa, device=msa.device)[:num_pick]
+            else:
+                msa_indices = torch.empty(num_pick, dtype=torch.long, device=msa.device)
+            _tdist.broadcast(msa_indices, src=0)
+        else:
+            msa_indices = torch.randperm(num_msa, device=msa.device)[:num_pick]
         m = m[:, msa_indices]
         msa_mask = msa_mask[:, msa_indices]
 
@@ -1640,6 +1940,9 @@ def _run_msa_dap(msa_module, z_scattered, s_inputs, feats, full_pair_mask, use_k
             chunk_size_outer_product,
             chunk_size_tri_attn,
             use_kernels,
+        )
+        z_scattered = restore_pair_storage_dtype(
+            z_scattered, dtype=pair_storage_dtype
         )
 
         # Collect granular checkpoints — dap_msa.py already gathered & saved to CPU
@@ -1670,6 +1973,10 @@ def _run_pairformer_dap(pf_module, s, z_scattered, mask, full_pair_mask, use_ker
     """
     dap_size = get_dap_size()
     dap_rank = get_dap_rank()
+    pair_storage_dtype = get_pair_storage_dtype()
+    z_scattered = restore_pair_storage_dtype(
+        z_scattered, dtype=pair_storage_dtype
+    )
     pair_mask_scattered = scatter(full_pair_mask, dim=1) if dap_size > 1 else full_pair_mask
 
     # Set chunk sizes for large N (same logic as MSA module)
@@ -1677,12 +1984,19 @@ def _run_pairformer_dap(pf_module, s, z_scattered, mask, full_pair_mask, use_ker
     if not pf_module.training:
         from boltz.data import const
         if N > const.chunk_size_threshold:
+            chunk_size_transition_z = 64
             # Reduce chunk size for very long sequences to prevent OOM
             # in Q@K^T attention score computation
-            chunk_size_tri_attn = 16 if N > 2000 else 128
+            chunk_size_tri_attn = _tri_attn_chunk_size(
+                N,
+                default_long=16,
+                default_small=128,
+            )
         else:
+            chunk_size_transition_z = None
             chunk_size_tri_attn = 512
     else:
+        chunk_size_transition_z = None
         chunk_size_tri_attn = None
 
     # Per-layer checkpoint saving (controlled by env var)
@@ -1696,8 +2010,12 @@ def _run_pairformer_dap(pf_module, s, z_scattered, mask, full_pair_mask, use_ker
         s, z_scattered = layer(
             s, z_scattered, mask, pair_mask_scattered,
             chunk_size_tri_attn=chunk_size_tri_attn,
+            chunk_size_transition_z=chunk_size_transition_z,
             use_kernels=use_kernels,
             layer_idx=i,
+        )
+        z_scattered = restore_pair_storage_dtype(
+            z_scattered, dtype=pair_storage_dtype
         )
 
         # Save z every 4th layer + last layer for divergence analysis
@@ -1729,4 +2047,4 @@ def _run_pairformer_dap(pf_module, s, z_scattered, mask, full_pair_mask, use_ker
         del z_full
         os.environ["_BOLTZ_RECYCLE_CTR"] = str(_rc + 1)
 
-    return s, z_scattered
+    return s, restore_pair_storage_dtype(z_scattered, dtype=pair_storage_dtype)
