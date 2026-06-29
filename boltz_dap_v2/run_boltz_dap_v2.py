@@ -108,17 +108,17 @@ class GPUMonitor:
 @click.option("--use_flex_attention", is_flag=True, help="Use FlexAttention for triangle attention (memory/throughput)")
 @click.option("--use_flex_attention_chunked", is_flag=True, help="Use chunked FlexAttention for DAP (experimental; avoids 112GB OOM)")
 @click.option("--use_potentials", is_flag=True, help="Enable FK steering + physical guidance potentials")
-@click.option("--write_full_pae/--no_write_full_pae", default=True, help="Dump full PAE matrix to npz (default: on)")
-@click.option("--write_full_pde/--no_write_full_pde", default=True, help="Dump full PDE matrix to npz (default: on)")
+@click.option("--write_full_pae/--no_write_full_pae", default=False, help="Dump full PAE matrix to npz (default: off)")
+@click.option("--write_full_pde/--no_write_full_pde", default=False, help="Dump full PDE matrix to npz (default: off)")
 @click.option(
     "--save_trunk_checkpoints/--no_save_trunk_checkpoints",
-    default=True,
-    help="Save large trunk_checkpoints.pt debug artifact (default: on)",
+    default=False,
+    help="Save large trunk_checkpoints.pt debug artifact (default: off)",
 )
 @click.option(
     "--save_granular_checkpoints/--no_save_granular_checkpoints",
-    default=True,
-    help="Save granular_ckpts.pt debug artifact (default: on)",
+    default=False,
+    help="Save granular_ckpts.pt debug artifact (default: off)",
 )
 @click.option("--dc_pairwise_chunk_size", type=int, default=512, help="Row chunk size for diffusion pairwise conditioner")
 @click.option("--dc_token_bias_chunk_size", type=int, default=256, help="Row chunk size for diffusion token_trans_bias")
@@ -130,6 +130,13 @@ class GPUMonitor:
 )
 @click.option("--seed", type=int, default=None, help="Random seed for deterministic runs")
 @click.option("--skip_processing", is_flag=True, help="Reuse existing out_dir/processed without running process_inputs")
+@click.option(
+    "--nccl-timeout-seconds",
+    type=int,
+    default=43200,
+    show_default=True,
+    help="Process-group timeout for long rank-0 phases (e.g., confidence/write); exported as NCCL_TIMEOUT if unset.",
+)
 @click.option(
     "--template-t-chunk-size",
     type=int,
@@ -150,17 +157,22 @@ def main(
     use_potentials: bool = False,
     write_full_pae: bool = False,
     write_full_pde: bool = False,
-    save_trunk_checkpoints: bool = True,
-    save_granular_checkpoints: bool = True,
+    save_trunk_checkpoints: bool = False,
+    save_granular_checkpoints: bool = False,
     dc_pairwise_chunk_size: int = 512,
     dc_token_bias_chunk_size: int = 256,
     dc_atom_encoder_chunk_size: int = 256,
     keep_pde_logits: bool = False,
     seed: int = None,
     skip_processing: bool = False,
+    nccl_timeout_seconds: int = 43200,
     template_t_chunk_size: int | None = None,
 ):
     """Run Boltz 2 with proper FastFold-style DAP (no model duplication)."""
+
+    # Avoid 2h default process-group timeout when rank0 runs long post-trunk stages.
+    if "NCCL_TIMEOUT" not in os.environ:
+        os.environ["NCCL_TIMEOUT"] = str(nccl_timeout_seconds)
 
     # Initialize DAP
     from boltz_distributed import init_dap, get_dap_size, get_dap_rank
