@@ -110,6 +110,7 @@ def init_dap(dap_size=None):
                     device_id=torch.device(f"cuda:{local_rank}"),
                 )
             except TypeError:
+                # Older PyTorch versions do not accept device_id.
                 torch.distributed.init_process_group(**init_kwargs)
         
         _DAP_SIZE = torch.distributed.get_world_size()

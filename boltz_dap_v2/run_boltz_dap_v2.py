@@ -16,7 +16,6 @@ Requirements:
     - boltz environment activated
 """
 
-import gc
 import os
 import sys
 import traceback
@@ -39,6 +38,33 @@ def _missing_boltz2_cache_files(cache: Path, canonical_tokens) -> list[Path]:
     required = [cache / "boltz2_conf.ckpt"]
     required.extend(cache / "mols" / f"{token}.pkl" for token in canonical_tokens)
     return [path for path in required if not path.is_file()]
+
+
+def _process_ram_mb() -> tuple[int | None, int | None, int | None]:
+    """Return process RSS plus cgroup memory usage/limit in MB when available."""
+    rss_mb = None
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    rss_mb = int(line.split()[1]) // 1024
+                    break
+    except OSError:
+        pass
+
+    cgroup_used_mb = None
+    cgroup_limit_mb = None
+    try:
+        with open("/sys/fs/cgroup/memory.current") as f:
+            cgroup_used_mb = int(f.read().strip()) // (1024 * 1024)
+        with open("/sys/fs/cgroup/memory.max") as f:
+            raw_limit = f.read().strip()
+            if raw_limit != "max":
+                cgroup_limit_mb = int(raw_limit) // (1024 * 1024)
+    except OSError:
+        pass
+
+    return rss_mb, cgroup_used_mb, cgroup_limit_mb
 
 
 class GPUMonitor:
@@ -82,13 +108,23 @@ class GPUMonitor:
 
     def _monitor(self):
         with open(self.log_file, 'w') as f:
-            f.write("timestamp,gpu_id,mem_used_mb,mem_total_mb,util_pct,temp_c\n")
+            f.write(
+                "timestamp,gpu_id,mem_used_mb,mem_total_mb,util_pct,temp_c,"
+                "rank0_rss_mb,cgroup_used_mb,cgroup_limit_mb\n"
+            )
             start_time = time.time()
             while self.running:
                 elapsed = time.time() - start_time
                 mem_info = self._get_gpu_memory()
+                rss_mb, cgroup_used_mb, cgroup_limit_mb = _process_ram_mb()
+                rss_field = "" if rss_mb is None else str(rss_mb)
+                cgroup_used_field = "" if cgroup_used_mb is None else str(cgroup_used_mb)
+                cgroup_limit_field = "" if cgroup_limit_mb is None else str(cgroup_limit_mb)
                 for gpu_id, used, total, util, temp in mem_info:
-                    f.write(f"{elapsed:.1f},{gpu_id},{used},{total},{util},{temp}\n")
+                    f.write(
+                        f"{elapsed:.1f},{gpu_id},{used},{total},{util},{temp},"
+                        f"{rss_field},{cgroup_used_field},{cgroup_limit_field}\n"
+                    )
                     if gpu_id not in self.max_memory or used > self.max_memory[gpu_id]:
                         self.max_memory[gpu_id] = used
                 f.flush()
@@ -121,12 +157,19 @@ class GPUMonitor:
 @click.option(
     "--save_trunk_checkpoints/--no_save_trunk_checkpoints",
     default=False,
-    help="Save large trunk_checkpoints.pt debug artifact (default: off)",
+    help=(
+        "Save large trunk_checkpoints.pt debug artifact (default: off). "
+        "Enabling this gathers the full z tensor to CPU at every recycling step "
+        "and can OOM host RAM on large complexes; only use for baseline comparison."
+    ),
 )
 @click.option(
     "--save_granular_checkpoints/--no_save_granular_checkpoints",
     default=False,
-    help="Save granular_ckpts.pt debug artifact (default: off)",
+    help=(
+        "Save granular_ckpts.pt debug artifact (default: off). "
+        "Accumulates many full N x N tensors on CPU; debug/comparison use only."
+    ),
 )
 @click.option("--dc_pairwise_chunk_size", type=int, default=512, help="Row chunk size for diffusion pairwise conditioner")
 @click.option("--dc_token_bias_chunk_size", type=int, default=256, help="Row chunk size for diffusion token_trans_bias")
@@ -192,6 +235,12 @@ def main(
     dap_size = get_dap_size()
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     device = torch.device(f'cuda:{local_rank}')
+
+    def dist_barrier() -> None:
+        try:
+            dist.barrier(device_ids=[local_rank])
+        except TypeError:
+            dist.barrier()
 
     # Deterministic seeding for controlled A/B testing
     if seed is not None:
@@ -266,13 +315,20 @@ def main(
         BoltzProcessedInput,
         process_inputs,
         filter_inputs_structure,
-        _apply_template_t_chunk_size,
     )
     from boltz.model.models.boltz2 import Boltz2
     from boltz.data import const
     from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
     from boltz.data.types import Manifest
     from boltz.data.write.writer import BoltzWriter
+    from boltz_compat import (
+        apply_boltz_compat_patches,
+        _apply_template_t_chunk_size,
+    )
+
+    patched_components = apply_boltz_compat_patches()
+    if patched_components:
+        rank_print("  ✓ Applied Boltz compatibility patches: " + ", ".join(patched_components))
 
     rank_print("[1/6] Processing input data...")
 
@@ -371,7 +427,7 @@ def main(
     if use_potentials:
         steering_args.fk_steering = True
         steering_args.physical_guidance_update = True
-        rank_print(f"  ✓ Potentials enabled: FK steering + physical guidance")
+        rank_print("  ✓ Potentials enabled: FK steering + physical guidance")
 
     predict_args = {
         "recycling_steps": recycling_steps,
@@ -396,7 +452,7 @@ def main(
         steering_args=asdict(steering_args),
     )
     model.eval()
-    rank_print(f"  ✓ Model loaded to CPU (all ranks)")
+    rank_print("  ✓ Model loaded to CPU (all ranks)")
     _apply_template_t_chunk_size(model, template_t_chunk_size)
     if template_t_chunk_size is not None:
         rank_print(f"  ✓ template_t_chunk_size={template_t_chunk_size} (template pairformer)")
@@ -428,7 +484,7 @@ def main(
     # GPU 0: gets the FULL model (trunk + post-trunk)
     # GPU 1+: gets ONLY trunk modules (input_embedder, msa, pairformer,
     #         template, recycling). Post-trunk stays on CPU and is never used.
-    rank_print(f"\n[3/6] Placing modules on GPUs (selective, no duplication)...")
+    rank_print("\n[3/6] Placing modules on GPUs (selective, no duplication)...")
 
     # Trunk modules needed on ALL GPUs (for DAP):
     trunk_module_names = [
@@ -466,15 +522,15 @@ def main(
         print(f"  GPU {dap_rank}: Other post-trunk modules (structure, diffusion) stay on CPU")
 
     # Inject DAP wrappers
-    rank_print(f"\n[4/6] Injecting DAP wrappers...")
+    rank_print("\n[4/6] Injecting DAP wrappers...")
 
     from dap_trunk import inject_dap_into_model
     model = inject_dap_into_model(model)
 
-    rank_print(f"  ✓ DAP injection complete")
+    rank_print("  ✓ DAP injection complete")
 
     # Create data module
-    rank_print(f"\n[5/6] Running inference with DAP...")
+    rank_print("\n[5/6] Running inference with DAP...")
 
     data_module = Boltz2InferenceDataModule(
         manifest=processed.manifest,
@@ -551,10 +607,10 @@ def main(
         print(f"    GPU {dap_rank}: Peak memory: {peak_mem:.0f} MB ({peak_mem/1024:.1f} GB)")
 
         # Barrier to sync all GPUs before next batch
-        dist.barrier()
+        dist_barrier()
 
         if pred_dict is not None and pred_dict.get("exception", False):
-            rank_print(f"    ✗ OOM during inference!")
+            rank_print("    ✗ OOM during inference!")
             continue
 
         # Only rank 0 writes output
@@ -584,20 +640,20 @@ def main(
         monitor.report()
 
     # Check output
-    rank_print(f"\n[6/6] Checking output...")
+    rank_print("\n[6/6] Checking output...")
 
     if dap_rank == 0:
         cif_files = list((out_dir / "predictions").rglob("*.cif"))
         if cif_files:
             rank_print(f"  ✓ CIF file: {cif_files[0]}")
         else:
-            rank_print(f"  ✗ No CIF file found")
+            rank_print("  ✗ No CIF file found")
 
     rank_print(f"\n{'='*70}")
     rank_print("COMPLETE")
     rank_print(f"{'='*70}\n")
 
-    dist.barrier()
+    dist_barrier()
     dist.destroy_process_group()
 
 
