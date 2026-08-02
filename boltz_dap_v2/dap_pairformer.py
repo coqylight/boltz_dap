@@ -60,6 +60,7 @@ class DAPPairformerLayer(nn.Module):
         use_cuequiv_mul: bool = False,
         use_cuequiv_attn: bool = False,
         layer_idx: int = -1,
+        chunk_size_transition_z: Optional[int] = None,
     ) -> tuple[Tensor, Tensor]:
         """Forward.
 
@@ -101,7 +102,19 @@ class DAPPairformerLayer(nn.Module):
 
         # 1. TriMulOut
         dropout = get_dropout_mask(self.dropout, z, self.training)
-        z = z + dropout * self.tri_mul_out(z, mask=pair_mask, use_kernels=use_kernels)
+        if self.training and torch.is_grad_enabled():
+            z = z + dropout * self.tri_mul_out(
+                z,
+                mask=pair_mask,
+                use_kernels=use_kernels,
+            )
+        else:
+            z = self.tri_mul_out.forward_with_residual(
+                z,
+                pair_mask,
+                dropout,
+                use_kernels=use_kernels,
+            )
         _mem("after tri_mul_out")
         _save_z("after_trimul_out")
 
@@ -109,51 +122,70 @@ class DAPPairformerLayer(nn.Module):
         z_col = row_to_col(z)
         pair_mask_col = row_to_col(pair_mask.unsqueeze(-1)).squeeze(-1)
         dropout = get_dropout_mask(self.dropout, z_col, self.training)
-        z_col = z_col + dropout * self.tri_mul_in(z_col, mask=pair_mask_col, use_kernels=use_kernels)
-        z = col_to_row(z_col)
-        del z_col
-        if z.shape[2] > original_N:
-            z = z[:, :, :original_N, :]
+        if self.training and torch.is_grad_enabled():
+            z_col = z_col + dropout * self.tri_mul_in(
+                z_col,
+                mask=pair_mask_col,
+                use_kernels=use_kernels,
+            )
+        else:
+            z_col = self.tri_mul_in.forward_with_residual(
+                z_col,
+                pair_mask_col,
+                dropout,
+                use_kernels=use_kernels,
+            )
+        z_row = col_to_row(z_col)
+        del z_col, pair_mask_col, dropout
+        if z_row.shape[2] > original_N:
+            z_row = z_row[:, :, :original_N, :]
+        if self.training and torch.is_grad_enabled():
+            z = z_row
+        else:
+            z.copy_(z_row)
+            del z_row
         _mem("after tri_mul_in")
         _save_z("after_trimul_in")
 
         # 3. TriAttStart (scattered, gathers only bias)
+        tri_att_use_kernels = use_kernels and not (
+            dap_size > 1 and not self.training and not torch.is_grad_enabled()
+        )
         dropout = get_dropout_mask(self.dropout, z, self.training)
-        z = z + dropout * self.tri_att_start(
-            z, mask=pair_mask, chunk_size=chunk_size_tri_attn, use_kernels=use_kernels,
+        z = self.tri_att_start.forward_with_residual(
+            z,
+            pair_mask,
+            dropout,
+            chunk_size=chunk_size_tri_attn,
+            use_kernels=tri_att_use_kernels,
         )
         _mem("after tri_att_start")
         _save_z("after_triatt_start")
 
         # 4. TriAttEnd (internally handles row_to_col)
         dropout = get_dropout_mask(self.dropout, z, self.training, columnwise=True)
-        z = z + dropout * self.tri_att_end(
-            z, mask=pair_mask, chunk_size=chunk_size_tri_attn, use_kernels=use_kernels,
+        z = self.tri_att_end.forward_with_residual(
+            z,
+            pair_mask,
+            dropout,
+            chunk_size=chunk_size_tri_attn,
+            use_kernels=tri_att_use_kernels,
         )
         _mem("after tri_att_end")
         _save_z("after_triatt_end")
 
         # 5. Transition (pointwise, chunked to avoid 4×D expansion spike)
-        z = z + self.transition_z(z)
+        transition_update = self.transition_z(z, chunk_size_transition_z)
+        if self.training and torch.is_grad_enabled():
+            z = z + transition_update
+        else:
+            z.add_(transition_update)
+        del transition_update
         _mem("after transition_z")
 
-        # === Sequence attention (gather only bias, not full z) ===
-        # proj_z: z [B, I, J, D] → bias [B, H, I, J] (LayerNorm + Linear(D→H) + Rearrange)
-        # Compute bias on scattered z, then gather only H channels (vs D=128)
-        if dap_size > 1:
-            # z is [B, N/dap, N, D] → proj_z → [B, H, N/dap, N]
-            pair_bias = self.attention.proj_z(z)
-            # Gather along dim=2 (the scattered I dimension, now after rearrange to H-first)
-            pair_bias = gather(pair_bias.contiguous(), dim=2, original_size=original_N)
-            # pair_bias is now [B, H, N, N] — full bias, no full z needed!
-        else:
-            pair_bias = self.attention.proj_z(z)
-        _mem("after proj_z+gather")
-
+        # === Sequence attention ===
         with torch.autocast("cuda", enabled=False):
             s_normed = self.pre_norm_s(s.float())
-
-            # Call attention with pre-computed bias (skip internal proj_z)
             B = s_normed.shape[0]
             attn_mod = self.attention
             q = attn_mod.proj_q(s_normed).view(B, -1, attn_mod.num_heads, attn_mod.head_dim)
@@ -161,16 +193,70 @@ class DAPPairformerLayer(nn.Module):
             v = attn_mod.proj_v(s_normed).view(B, -1, attn_mod.num_heads, attn_mod.head_dim)
             g = attn_mod.proj_g(s_normed).sigmoid()
 
-            with torch.autocast("cuda", enabled=False):
+            if dap_size > 1 and not self.training and not torch.is_grad_enabled():
+                pair_bias_local = attn_mod.proj_z(z)
+                local_rows = z.shape[1]
+                row_offset = dap_rank * local_rows
+                valid_rows = max(0, min(local_rows, original_N - row_offset))
+                q_chunk = int(os.environ.get("BOLTZ_SEQ_ATTN_Q_CHUNK", "64"))
+                q_chunk = min(max(1, q_chunk), max(1, valid_rows))
+                local_update = torch.zeros(
+                    B,
+                    local_rows,
+                    attn_mod.c_s,
+                    dtype=s_normed.dtype,
+                    device=s_normed.device,
+                )
+
+                for q_start in range(0, valid_rows, q_chunk):
+                    q_end = min(q_start + q_chunk, valid_rows)
+                    global_start = row_offset + q_start
+                    global_end = row_offset + q_end
+                    q_part = q[:, global_start:global_end]
+                    g_part = g[:, global_start:global_end]
+                    pair_bias_part = pair_bias_local[:, :, q_start:q_end].float()
+
+                    attn = torch.einsum("bihd,bjhd->bhij", q_part.float(), k.float())
+                    attn = attn / (attn_mod.head_dim ** 0.5) + pair_bias_part
+                    attn = attn + (1 - mask[:, None, None].float()) * -attn_mod.inf
+                    attn = attn.softmax(dim=-1)
+                    o_part = torch.einsum(
+                        "bhij,bjhd->bihd",
+                        attn,
+                        v.float(),
+                    ).to(v.dtype)
+                    o_part = o_part.reshape(B, q_end - q_start, attn_mod.c_s)
+                    local_update[:, q_start:q_end] = attn_mod.proj_o(g_part * o_part)
+                    del attn, g_part, o_part, pair_bias_part, q_part
+
+                del pair_bias_local
+                sequence_update = gather(
+                    local_update.contiguous(),
+                    dim=1,
+                    original_size=original_N,
+                )
+                del local_update
+                s = s.float() + sequence_update
+                del sequence_update
+            else:
+                pair_bias = attn_mod.proj_z(z)
+                if dap_size > 1:
+                    pair_bias = gather(
+                        pair_bias.contiguous(),
+                        dim=2,
+                        original_size=original_N,
+                    )
                 attn = torch.einsum("bihd,bjhd->bhij", q.float(), k.float())
                 attn = attn / (attn_mod.head_dim ** 0.5) + pair_bias.float()
                 attn = attn + (1 - mask[:, None, None].float()) * -attn_mod.inf
                 attn = attn.softmax(dim=-1)
                 o = torch.einsum("bhij,bjhd->bihd", attn, v.float()).to(v.dtype)
+                del pair_bias
+                o = o.reshape(B, -1, attn_mod.c_s)
+                s = s.float() + attn_mod.proj_o(g * o)
+                del attn, o
 
-            del pair_bias
-            o = o.reshape(B, -1, attn_mod.c_s)
-            s = s.float() + attn_mod.proj_o(g * o)
+            del g, k, q, s_normed, v
             s = s + self.transition_s(s)
             s = self.s_post_norm(s)
 

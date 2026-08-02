@@ -27,7 +27,7 @@ import os
 # Late-imported in _run_template_dap when dap_size > 1
 # from dap_tri_att import DAPTriAttStart, DAPTriAttEnd
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
-from boltz_distributed.comm import scatter, gather, row_to_col, col_to_row
+from boltz_distributed.comm import scatter, gather, gather_to_rank0_cpu, row_to_col, col_to_row
 from boltz_distributed.core import get_dap_size, get_dap_rank
 
 from dap_msa import DAPMSALayer
@@ -36,7 +36,210 @@ from dap_pairformer_noseq import DAPPairformerNoSeqLayer
 from dap_confidence import inject_dap_into_confidence, run_confidence_dap
 
 
-def _run_atom_encoder_with_chunked_zcond(ae, feats, s_trunk, z_cond, chunk_rows: int):
+def _env_positive_int(name: str) -> Optional[int]:
+    raw = os.environ.get(name, "").strip()
+    if raw == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _tri_attn_chunk_size(n_tokens: int, *, default_long: int, default_small: int) -> int:
+    override = _env_positive_int("BOLTZ_TRI_ATT_CHUNK")
+    if override is not None:
+        return override
+    if n_tokens >= 8000:
+        return 2
+    if n_tokens > 2000:
+        return default_long
+    return default_small
+
+
+def _pin_memory_enabled() -> bool:
+    return bool(torch.cuda.is_available())
+
+
+def _project_msa_features_chunked(
+    msa_proj: nn.Module,
+    msa: Tensor,
+    has_deletion: Tensor,
+    deletion_value: Tensor,
+    is_paired: Tensor,
+    use_paired_feature: bool,
+    num_tokens: int,
+    sequence_chunk: int,
+) -> Tensor:
+    projected = None
+    chunk_size = max(1, min(int(sequence_chunk), msa.shape[1]))
+    for sequence_start in range(0, msa.shape[1], chunk_size):
+        sequence_end = min(sequence_start + chunk_size, msa.shape[1])
+        feature_parts = [
+            torch.nn.functional.one_hot(
+                msa[:, sequence_start:sequence_end], num_classes=num_tokens
+            ),
+            has_deletion[:, sequence_start:sequence_end],
+            deletion_value[:, sequence_start:sequence_end],
+        ]
+        if use_paired_feature:
+            feature_parts.append(is_paired[:, sequence_start:sequence_end])
+        feature_chunk = torch.cat(feature_parts, dim=-1)
+        projected_chunk = msa_proj(feature_chunk)
+        if projected is None:
+            projected = torch.empty(
+                (*msa.shape, projected_chunk.shape[-1]),
+                dtype=projected_chunk.dtype,
+                device=projected_chunk.device,
+            )
+        projected[:, sequence_start:sequence_end].copy_(projected_chunk)
+        del feature_parts, feature_chunk, projected_chunk
+    if projected is None:
+        raise ValueError("MSA must contain at least one sequence")
+    return projected
+
+
+def _add_cpu_row_residual_(target: Tensor, residual_cpu: Tensor, chunk_rows: int) -> None:
+    if residual_cpu.device.type != "cpu":
+        raise ValueError("residual_cpu must be a CPU tensor")
+    if target.shape != residual_cpu.shape:
+        raise ValueError(
+            f"target and residual_cpu shapes differ: {target.shape} != {residual_cpu.shape}"
+        )
+
+    row_chunk = max(1, int(chunk_rows))
+    for row_start in range(0, target.shape[1], row_chunk):
+        row_end = min(row_start + row_chunk, target.shape[1])
+        residual_chunk = residual_cpu[:, row_start:row_end].to(
+            device=target.device,
+            dtype=target.dtype,
+            non_blocking=residual_cpu.is_pinned(),
+        )
+        target[:, row_start:row_end].add_(residual_chunk)
+        del residual_chunk
+
+
+def _module_device(module: nn.Module) -> torch.device:
+    return next(module.parameters()).device
+
+
+def _run_pairwise_conditioner_to_cpu(
+    pairwise_conditioner: nn.Module,
+    z_cpu: Tensor,
+    relative_position_encoding: Tensor,
+    chunk_rows: int,
+    transition_chunk: Optional[int] = None,
+    mem_log=None,
+) -> Tensor:
+    """Run diffusion pairwise conditioning row chunks and stage output on CPU."""
+    if z_cpu.device.type != "cpu" or relative_position_encoding.device.type != "cpu":
+        raise ValueError("z_cpu and relative_position_encoding must be CPU tensors")
+
+    device = _module_device(pairwise_conditioner)
+    if device.type != "cuda":
+        pairwise_conditioner.cuda()
+        device = _module_device(pairwise_conditioner)
+
+    n_tokens = z_cpu.shape[1]
+    row_chunk = max(1, int(chunk_rows))
+    probe = torch.zeros(
+        1,
+        1,
+        1,
+        z_cpu.shape[-1] + relative_position_encoding.shape[-1],
+        dtype=z_cpu.dtype,
+        device=device,
+    )
+    probe_out = pairwise_conditioner.dim_pairwise_init_proj(probe)
+    out_dim = probe_out.shape[-1]
+    del probe, probe_out
+    if mem_log is not None:
+        mem_log("  dc: pairwise out_dim probed")
+
+    pin = _pin_memory_enabled()
+    z_cond_cpu = torch.empty(
+        1,
+        n_tokens,
+        n_tokens,
+        out_dim,
+        dtype=z_cpu.dtype,
+        device="cpu",
+        pin_memory=pin,
+    )
+    if mem_log is not None:
+        mem_log("  dc: z_cond CPU buffer allocated")
+
+    for row_start in range(0, n_tokens, row_chunk):
+        row_end = min(row_start + row_chunk, n_tokens)
+        chunk_in = torch.cat(
+            (
+                z_cpu[:, row_start:row_end],
+                relative_position_encoding[:, row_start:row_end],
+            ),
+            dim=-1,
+        ).to(device=device, non_blocking=pin)
+        chunk_out = pairwise_conditioner.dim_pairwise_init_proj(chunk_in)
+        del chunk_in
+        for transition in pairwise_conditioner.transitions:
+            chunk_out = transition(chunk_out, transition_chunk) + chunk_out
+        z_cond_cpu[:, row_start:row_end].copy_(chunk_out, non_blocking=pin)
+        del chunk_out
+
+    return z_cond_cpu
+
+
+def _run_token_trans_bias_from_zcond_cpu(
+    layers: nn.ModuleList,
+    z_cond_cpu: Tensor,
+    chunk_rows: int,
+) -> Tensor:
+    """Run token transformer bias projections from CPU-staged z_cond."""
+    if z_cond_cpu.device.type != "cpu":
+        raise ValueError("z_cond_cpu must be a CPU tensor")
+    if not layers:
+        raise ValueError("token transformer projection layers are empty")
+
+    device = _module_device(layers[0])
+    if device.type != "cuda":
+        for layer in layers:
+            layer.cuda()
+        device = _module_device(layers[0])
+
+    pin = _pin_memory_enabled()
+    n_tokens = z_cond_cpu.shape[1]
+    row_chunk = max(1, int(chunk_rows))
+    probe = torch.zeros(1, 1, 1, z_cond_cpu.shape[-1], dtype=z_cond_cpu.dtype, device=device)
+    probe_out = layers[0](probe)
+    per_layer_dim = probe_out.shape[-1]
+    del probe, probe_out
+    token_trans_bias_cpu = torch.empty(
+        1,
+        n_tokens,
+        n_tokens,
+        len(layers) * per_layer_dim,
+        dtype=z_cond_cpu.dtype,
+        device="cpu",
+        pin_memory=pin,
+    )
+    for row_start in range(0, n_tokens, row_chunk):
+        row_end = min(row_start + row_chunk, n_tokens)
+        z_chunk = z_cond_cpu[:, row_start:row_end].to(device=device, non_blocking=pin)
+        bias_gpu = torch.cat([layer(z_chunk) for layer in layers], dim=-1)
+        token_trans_bias_cpu[:, row_start:row_end].copy_(bias_gpu, non_blocking=pin)
+        del bias_gpu, z_chunk
+    return token_trans_bias_cpu
+
+
+def _run_atom_encoder_with_chunked_zcond(
+    ae,
+    feats,
+    s_trunk,
+    z_cond,
+    chunk_rows: int,
+    atom_window_chunk: Optional[int] = None,
+    mem_log=None,
+):
     """Run :class:`AtomEncoder` forward with chunked ``z_to_p`` from ``z_cond``.
 
     Mirrors ``boltz.model.modules.encodersv2.AtomEncoder.forward`` for
@@ -47,9 +250,12 @@ def _run_atom_encoder_with_chunked_zcond(ae, feats, s_trunk, z_cond, chunk_rows:
     Parameters
     ----------
     z_cond
-        Pairwise conditioning ``[B, Nt, Nt, tz]`` on CUDA (same ``B``/``Nt`` as trunk).
+        Pairwise conditioning ``[B, Nt, Nt, tz]`` on CPU or CUDA (same ``B``/``Nt`` as trunk).
     chunk_rows
-        Token row chunk size; reuse ``BOLTZ_DC_ATOM_ENCODER_CHUNK`` in the caller.
+        Kept for backward-compatible callers; the indexed path does not need token-row
+        chunks because it gathers only the atom-window token pairs it consumes.
+    atom_window_chunk
+        Number of atom windows to project per CUDA chunk.
     """
     from functools import partial
 
@@ -60,6 +266,21 @@ def _run_atom_encoder_with_chunked_zcond(ae, feats, s_trunk, z_cond, chunk_rows:
     with torch.autocast("cuda", enabled=False):
         B, N, _ = feats["ref_pos"].shape
         atom_mask = feats["atom_pad_mask"].bool()
+        atom_to_token_raw = feats["atom_to_token"]
+        atom_token_valid = atom_to_token_raw.sum(dim=-1) > 0
+        atom_token_idx = atom_to_token_raw.argmax(dim=-1).long()
+
+        def gather_token_features(token_features: Tensor) -> Tensor:
+            gather_idx = atom_token_idx.clamp(
+                min=0, max=token_features.shape[1] - 1
+            ).to(device=token_features.device)
+            gathered = torch.gather(
+                token_features,
+                1,
+                gather_idx.unsqueeze(-1).expand(-1, -1, token_features.shape[-1]),
+            )
+            valid = atom_token_valid.to(device=token_features.device)
+            return gathered * valid.unsqueeze(-1).to(dtype=gathered.dtype)
 
         atom_ref_pos = feats["ref_pos"]
         atom_uid = feats["ref_space_uid"]
@@ -82,13 +303,13 @@ def _run_atom_encoder_with_chunked_zcond(ae, feats, s_trunk, z_cond, chunk_rows:
                 ],
                 dim=-1,
             )
-            atom_to_token = feats["atom_to_token"].float()
-            atom_res_feats = torch.bmm(atom_to_token, res_feats)
-            atom_feats.append(atom_res_feats)
+            atom_feats.append(gather_token_features(res_feats))
 
         atom_feats = torch.cat(atom_feats, dim=-1)
 
         c = ae.embed_atom_features(atom_feats)
+        if mem_log is not None:
+            mem_log("  dc: atom_encoder embedded atom features")
 
         W, H = ae.atoms_per_window_queries, ae.atoms_per_window_keys
         B, N = c.shape[:2]
@@ -97,6 +318,8 @@ def _run_atom_encoder_with_chunked_zcond(ae, feats, s_trunk, z_cond, chunk_rows:
         to_keys = partial(
             single_to_keys, indexing_matrix=keys_indexing_matrix, W=W, H=H
         )
+        if mem_log is not None:
+            mem_log("  dc: atom_encoder built key indexer")
 
         atom_ref_pos_queries = atom_ref_pos.view(B, K, W, 1, 3)
         atom_ref_pos_keys = to_keys(atom_ref_pos).view(B, K, 1, H, 3)
@@ -126,50 +349,92 @@ def _run_atom_encoder_with_chunked_zcond(ae, feats, s_trunk, z_cond, chunk_rows:
         p = ae.embed_atompair_ref_pos(d) * v
         p = p + ae.embed_atompair_ref_dist(d_norm) * v
         p = p + ae.embed_atompair_mask(v) * v
+        if mem_log is not None:
+            mem_log("  dc: atom_encoder built base pair features")
 
         q = c
 
         if ae.structure_prediction:
-            atom_to_token = feats["atom_to_token"].float()
-
             s_to_c = ae.s_to_c_trans(s_trunk.float())
-            s_to_c = torch.bmm(atom_to_token, s_to_c)
-            c = c + s_to_c.to(c)
-
-            atom_to_token_queries = atom_to_token.view(
-                B, K, W, atom_to_token.shape[-1]
-            )
-            atom_to_token_keys = to_keys(atom_to_token)
+            c = c + gather_token_features(s_to_c).to(c)
 
             Nt = z_cond.shape[1]
-            p_z_acc = torch.zeros(
-                (B, K, W, H, p.shape[-1]),
-                device=p.device,
-                dtype=torch.float32,
-            )
+            atom_token_idx = atom_token_idx.clamp(min=0, max=Nt - 1)
+            atom_token_queries = atom_token_idx.view(B, K, W)
+            atom_token_query_valid = atom_token_valid.view(B, K, W)
+            atom_token_keys = to_keys(atom_token_idx.float().unsqueeze(-1)).squeeze(-1).long()
+            atom_token_keys = atom_token_keys.clamp(min=0, max=Nt - 1)
+            atom_token_key_valid = to_keys(atom_token_valid.float().unsqueeze(-1)).squeeze(-1) > 0.5
+            if mem_log is not None:
+                mem_log("  dc: atom_encoder built compact token indices")
+
             ztp = ae.z_to_p_trans
-            cr = max(1, int(chunk_rows))
-            for i0 in range(0, Nt, cr):
-                i1 = min(i0 + cr, Nt)
-                z_chunk = z_cond[:, i0:i1]
-                z_row = ztp(z_chunk.float())
-                Qc = atom_to_token_queries[:, :, :, i0:i1]
-                p_z_acc.add_(
-                    torch.einsum(
-                        "bijd,bwki,bwlj->bwkld",
-                        z_row,
-                        Qc,
-                        atom_to_token_keys,
+            z_device = _module_device(ztp)
+            kw = atom_window_chunk if atom_window_chunk is not None else chunk_rows
+            kw = max(1, int(kw))
+            pin = z_cond.device.type == "cpu" and _pin_memory_enabled()
+            for k0 in range(0, K, kw):
+                k1 = min(k0 + kw, K)
+                q_idx = atom_token_queries[:, k0:k1].to(device=z_cond.device)
+                k_idx = atom_token_keys[:, k0:k1].to(device=z_cond.device)
+                z_pairs = []
+                for batch_idx in range(B):
+                    z_pairs.append(
+                        z_cond[
+                            batch_idx,
+                            q_idx[batch_idx, :, :, None],
+                            k_idx[batch_idx, :, None, :],
+                        ]
                     )
-                )
-                del z_row, z_chunk
-            p = p + p_z_acc.to(dtype=p.dtype)
+                z_pair = torch.stack(z_pairs, dim=0)
+                if z_pair.device != z_device:
+                    z_pair = z_pair.to(device=z_device, non_blocking=pin)
+                z_pair = ztp(z_pair.float())
+                valid_pair = (
+                    atom_token_query_valid[:, k0:k1, :, None]
+                    & atom_token_key_valid[:, k0:k1, None, :]
+                ).to(device=z_pair.device)
+                z_pair = z_pair * valid_pair.unsqueeze(-1)
+                p[:, k0:k1].add_(z_pair.to(dtype=p.dtype))
+                del z_pair, z_pairs, valid_pair
+                if mem_log is not None and (k0 == 0 or k1 == K):
+                    mem_log(f"  dc: atom_encoder projected atom windows [{k0}:{k1}]")
 
         p = p + ae.c_to_p_trans_q(c.view(B, K, W, 1, c.shape[-1]))
         p = p + ae.c_to_p_trans_k(to_keys(c).view(B, K, 1, H, c.shape[-1]))
         p = p + ae.p_mlp(p)
 
     return q, c, p, to_keys
+
+
+def _run_distogram_from_cpu(distogram_module, z_cpu: Tensor, chunk_rows: int) -> Tensor:
+    """Run the distogram head row-by-row from CPU-backed pair features."""
+    B, N, _, _ = z_cpu.shape
+    linear = distogram_module.distogram
+    if not linear.weight.is_cuda:
+        distogram_module.cuda()
+    device = linear.weight.device
+    dtype = linear.weight.dtype
+    out_shape = (B, N, N, distogram_module.num_distograms, distogram_module.num_bins)
+    pdistogram_cpu = torch.empty(out_shape, dtype=dtype, device="cpu")
+    for row_start in range(0, N, chunk_rows):
+        row_end = min(row_start + chunk_rows, N)
+        row_chunk = z_cpu[:, row_start:row_end, :, :].to(
+            device=device, dtype=dtype, non_blocking=False
+        )
+        col_chunk = z_cpu[:, :, row_start:row_end, :].transpose(1, 2).to(
+            device=device, dtype=dtype, non_blocking=False
+        )
+        logits = linear(row_chunk + col_chunk).reshape(
+            B,
+            row_end - row_start,
+            N,
+            distogram_module.num_distograms,
+            distogram_module.num_bins,
+        )
+        pdistogram_cpu[:, row_start:row_end].copy_(logits.cpu())
+        del row_chunk, col_chunk, logits
+    return pdistogram_cpu
 
 
 def inject_dap_into_model(model):
@@ -253,7 +518,17 @@ def _zs_checkpoint(label, z_scattered, s, original_N):
     """
     dap_rank = get_dap_rank()
     dap_size = get_dap_size()
-    
+
+    # When trunk checkpoint saving is disabled, skip gather and heavy CPU copies.
+    # torch.save is also skipped (see BOLTZ_SAVE_TRUNK_CKPT gate); placeholders only.
+    if os.environ.get("BOLTZ_SAVE_TRUNK_CKPT", "1") != "1":
+        if dap_rank == 0:
+            _v = os.environ.get("BOLTZ_SAVE_TRUNK_CKPT", "")
+            print(
+                f"    [CKP] [{label}]  (skipped full gather — BOLTZ_SAVE_TRUNK_CKPT={_v})"
+            )
+        return {"z": torch.zeros(1), "s": torch.zeros(1)}
+
     if dap_size > 1:
         N_padded = ((original_N + dap_size - 1) // dap_size) * dap_size
         z_full = gather(z_scattered.contiguous(), dim=1, original_size=N_padded)
@@ -589,7 +864,15 @@ def _make_dap_forward(model):
                             msa = msa._orig_mod
 
                         _save_gran_ckpt = os.environ.get("BOLTZ_SAVE_GRAN_CKPT", "1") == "1"
-                        z_before_msa = z_scattered
+                        _msa_mutates_input = not (
+                            msa.training and torch.is_grad_enabled()
+                        )
+                        if _msa_mutates_input:
+                            z_before_msa = None
+                            z_before_msa_cpu = z_scattered.detach().to(device="cpu")
+                        else:
+                            z_before_msa = z_scattered
+                            z_before_msa_cpu = None
                         z_msa_out = _run_msa_dap(
                             msa, z_scattered, s_inputs, feats,
                             pair_mask, model.use_kernels,
@@ -607,8 +890,16 @@ def _make_dap_forward(model):
                                 _run_msa_dap._gran_ckpts = _msa_gran
                             del _z_msa_full
 
-                        z_scattered = z_before_msa + z_msa_out
-                        del z_before_msa, z_msa_out
+                        if z_before_msa_cpu is not None:
+                            _add_cpu_row_residual_(
+                                z_msa_out,
+                                z_before_msa_cpu,
+                                _env_positive_int("BOLTZ_MSA_RESIDUAL_CHUNK") or 32,
+                            )
+                            z_scattered = z_msa_out
+                        else:
+                            z_scattered = z_before_msa + z_msa_out
+                        del z_before_msa, z_before_msa_cpu, z_msa_out
                         _mem_log("after msa_module")
 
                         cp = _zs_checkpoint(f"R{i}/after_msa", z_scattered, s, original_N)
@@ -666,20 +957,15 @@ def _make_dap_forward(model):
                 torch.cuda.empty_cache()
                 _mem_log("after trunk offload to CPU")
 
-                # ── GATHER z back to full and TRIM to original_N ──
-                z = gather(z_scattered.contiguous(), dim=1, original_size=N_padded)
+                # ── GATHER z to rank 0 CPU and TRIM to original_N ──
+                z_cpu = gather_to_rank0_cpu(
+                    z_scattered.contiguous(), dim=1, original_size=original_N
+                )
                 del z_scattered
-                _mem_log("after gather z (full z restored)")
-                # Trim padding back to original sequence length
-                if N_padded != original_N:
-                    z = z[:, :original_N, :original_N, :]
-
-                # Non-rank-0 GPUs: free the full z immediately
-                # (only rank 0 needs it for post-trunk modules)
-                if dap_rank != 0:
-                    del z
-                    z = None
-                    torch.cuda.empty_cache()
+                torch.cuda.empty_cache()
+                _mem_log("after gather z to rank0 CPU")
+                if dap_rank == 0 and N_padded != original_N:
+                    z_cpu = z_cpu[:, :, :original_N, :].contiguous()
 
                 # Save checkpoints only when explicitly enabled; these artifacts are
                 # very large and not needed for normal inference runs.
@@ -694,20 +980,16 @@ def _make_dap_forward(model):
                         print(f"    [CKP] Saved {len(_checkpoints)} full-tensor checkpoints to {_ckpt_path} ({_ckpt_size:.0f} MB)")
 
             if dap_rank == 0:
-                pdistogram = model.distogram_module(z)
+                distogram_chunk = int(os.environ.get("BOLTZ_DISTOGRAM_CHUNK", "256"))
+                pdistogram = _run_distogram_from_cpu(
+                    model.distogram_module, z_cpu, distogram_chunk
+                )
                 dict_out = {"pdistogram": pdistogram, "s": s}
 
                 # Offload distogram after use
                 model.distogram_module.cpu()
                 torch.cuda.empty_cache()
-                _mem_log("after distogram (offloaded)")
-
-                # Move z to CPU BEFORE diffusion_conditioning to free ~5.5GB
-                # (z_cond = cat(z, rel_pos) would need ~11GB extra on GPU)
-                z_cpu = z.cpu()
-                del z
-                torch.cuda.empty_cache()
-                _mem_log("after z offloaded to CPU")
+                _mem_log("after distogram (streamed to CPU, offloaded)")
             else:
                 dict_out = {"s": s}
 
@@ -724,109 +1006,80 @@ def _make_dap_forward(model):
                     _mem_log("before diffusion_conditioning (inlined)")
                     dc = model.diffusion_conditioning
 
-                    # ① PairwiseConditioning — chunked along rows to avoid OOM
-                    # Without chunking, transition hidden expansion [N,N,512] = 22GB
+                    # Keep only the pairwise conditioner resident while building z_cond.
+                    # The 465335 frontier entered this block with little headroom, and
+                    # these modules are not needed until later conditioning stages.
+                    if hasattr(model, 'structure_module'):
+                        model.structure_module.cpu()
+                    if hasattr(model, 'confidence_module'):
+                        model.confidence_module.cpu()
+                    dc.atom_encoder.cpu()
+                    for layer in dc.token_trans_proj_z:
+                        layer.cpu()
+                    for layer in dc.atom_enc_proj_z:
+                        layer.cpu()
+                    for layer in dc.atom_dec_proj_z:
+                        layer.cpu()
+                    torch.cuda.empty_cache()
+                    _mem_log("  dc: downstream modules offloaded before pairwise")
+
+                    # ① PairwiseConditioning — row-chunked and CPU-staged.
+                    # A full [1,N,N,128] CUDA z_cond is too large for pentadecamer rank 0.
                     _mem_log("  dc: before pairwise_conditioner")
                     pw = dc.pairwise_conditioner
-                    N = z_cpu.shape[1]
-                    chunk_size = int(os.environ.get("BOLTZ_DC_PAIRWISE_CHUNK", "512"))
-
-                    # Allocate output z_cond on GPU
-                    # Determine output dim by probing with a small tensor
-                    _probe_in = torch.zeros(1, 1, 1, z_cpu.shape[-1] + relative_position_encoding.shape[-1],
-                                           dtype=z_cpu.dtype, device="cuda")
-                    _probe_out = pw.dim_pairwise_init_proj(_probe_in)
-                    out_dim = _probe_out.shape[-1]
-                    del _probe_in, _probe_out
-                    z_cond = torch.empty(1, N, N, out_dim, dtype=z_cpu.dtype, device="cuda")
-
-                    for row_start in range(0, N, chunk_size):
-                        row_end = min(row_start + chunk_size, N)
-                        # Slice z_cpu and rel_pos on CPU, concat, move chunk to GPU
-                        chunk_in = torch.cat(
-                            (z_cpu[:, row_start:row_end],
-                             relative_position_encoding[:, row_start:row_end]),
-                            dim=-1
-                        ).cuda()
-                        chunk_out = pw.dim_pairwise_init_proj(chunk_in)
-                        del chunk_in
-                        # Apply transitions in-place per chunk
-                        for transition in pw.transitions:
-                            chunk_out = transition(chunk_out) + chunk_out
-                        z_cond[:, row_start:row_end] = chunk_out
-                        del chunk_out
+                    pairwise_chunk = int(os.environ.get("BOLTZ_DC_PAIRWISE_CHUNK", "512"))
+                    transition_chunk = _env_positive_int("BOLTZ_DC_PAIRWISE_TRANSITION_CHUNK")
+                    if transition_chunk is None:
+                        transition_chunk = _env_positive_int("BOLTZ_TRANSITION_Z_CHUNK")
+                    z_cond_cpu = _run_pairwise_conditioner_to_cpu(
+                        pw,
+                        z_cpu,
+                        relative_position_encoding,
+                        pairwise_chunk,
+                        transition_chunk,
+                        mem_log=_mem_log,
+                    )
 
                     del relative_position_encoding  # Free CPU tensor
                     torch.cuda.empty_cache()
-                    _mem_log("  dc: after pairwise_conditioner (row-chunked)")
+                    _mem_log("  dc: after pairwise_conditioner (CPU-staged)")
 
                     # Offload pairwise_conditioner weights — no longer needed
                     pw.cpu()
                     torch.cuda.empty_cache()
                     _mem_log("  dc: pairwise_conditioner offloaded")
 
-                    # ② Token transformer biases — row-chunked like pairwise_conditioner
-                    # 24 projections of z_cond [B,N,N,128]→[B,N,N,8] each, cat to [B,N,N,192]
+                    # ② Token transformer biases — streamed from CPU-staged z_cond.
                     _mem_log("  dc: before token_trans_bias")
                     layers = dc.token_trans_proj_z
-                    n_layers = len(layers)
-                    # Probe output dim per layer
-                    _p_in = torch.zeros(1, 1, 1, out_dim, dtype=z_cond.dtype, device="cuda")
-                    _p_out = layers[0](_p_in)
-                    per_layer_dim = _p_out.shape[-1]
-                    del _p_in, _p_out
-                    total_bias_dim = n_layers * per_layer_dim
-
-                    # Stream rows to CPU — avoids a full [1,N,N,total_bias_dim] GPU alloc
-                    # (that tensor dominated peak VRAM with large N).
-                    _pin = bool(torch.cuda.is_available())
-                    token_trans_bias_cpu = torch.empty(
-                        1,
-                        N,
-                        N,
-                        total_bias_dim,
-                        dtype=z_cond.dtype,
-                        device="cpu",
-                        pin_memory=_pin,
-                    )
                     chunk_size_ttb = int(os.environ.get("BOLTZ_DC_TOKEN_BIAS_CHUNK", "256"))
-                    for row_start in range(0, N, chunk_size_ttb):
-                        row_end = min(row_start + chunk_size_ttb, N)
-                        z_chunk = z_cond[:, row_start:row_end]
-                        bias_gpu = torch.cat(
-                            [layer(z_chunk) for layer in layers], dim=-1
-                        )
-                        token_trans_bias_cpu[:, row_start:row_end].copy_(
-                            bias_gpu, non_blocking=_pin
-                        )
-                        del bias_gpu, z_chunk
-                    _mem_log("  dc: after token_trans_bias (row-chunked, streamed to CPU)")
+                    token_trans_bias_cpu = _run_token_trans_bias_from_zcond_cpu(
+                        layers, z_cond_cpu, chunk_size_ttb
+                    )
+                    _mem_log("  dc: after token_trans_bias (CPU-staged z_cond, streamed to CPU)")
 
                     # Offload token_trans_proj_z weights
                     for layer in dc.token_trans_proj_z:
                         layer.cpu()
-                    # Offload structure_module + confidence weights (not needed until later)
-                    # These are still on GPU from model init, taking ~10-15GB
-                    if hasattr(model, 'structure_module'):
-                        model.structure_module.cpu()
-                    if hasattr(model, 'confidence_module'):
-                        model.confidence_module.cpu()
-                    # Offload atom_enc/dec_proj_z (tiny but every MB counts)
-                    for layer in dc.atom_enc_proj_z:
-                        layer.cpu()
-                    for layer in dc.atom_dec_proj_z:
-                        layer.cpu()
                     torch.cuda.empty_cache()
                     _mem_log("  dc: struct/conf/bias all offloaded before atom_enc")
 
-                    # ③ AtomEncoder — chunked z_to_p fused with einsum (no full N×N z_to_p on GPU)
-                    _mem_log("  dc: before atom_encoder (chunked z_to_p + einsum)")
+                    # ③ AtomEncoder — indexed atom-window z_to_p streaming.
+                    _mem_log("  dc: before atom_encoder (indexed atom-window z_to_p)")
                     ae = dc.atom_encoder
+                    ae.cuda()
                     chunk_ae = max(1, int(os.environ.get("BOLTZ_DC_ATOM_ENCODER_CHUNK", "256")))
+                    atom_window_chunk = max(1, int(os.environ.get("BOLTZ_DC_ATOM_WINDOW_CHUNK", "16")))
                     q, c, p, to_keys = _run_atom_encoder_with_chunked_zcond(
-                        ae, feats, s, z_cond, chunk_ae
+                        ae,
+                        feats,
+                        s,
+                        z_cond_cpu,
+                        chunk_ae,
+                        atom_window_chunk=atom_window_chunk,
+                        mem_log=_mem_log,
                     )
-                    del z_cond
+                    del z_cond_cpu
                     torch.cuda.empty_cache()
                     _mem_log("  dc: after atom_encoder")
 
@@ -960,6 +1213,8 @@ def _make_dap_forward(model):
                                 feats=feats,
                                 num_sampling_steps=num_sampling_steps,
                                 atom_mask=feats["atom_pad_mask"].float(),
+                                fixed_atom_coords=feats["fixed_atom_coords"].float(),
+                                fixed_atom_mask=feats["fixed_atom_mask"],
                                 multiplicity=local_samples,
                                 max_parallel_samples=max_parallel_samples,
                                 steering_args=getattr(model, 'steering_args', None),
@@ -1031,6 +1286,8 @@ def _make_dap_forward(model):
                                 feats=feats,
                                 num_sampling_steps=num_sampling_steps,
                                 atom_mask=feats["atom_pad_mask"].float(),
+                                fixed_atom_coords=feats["fixed_atom_coords"].float(),
+                                fixed_atom_mask=feats["fixed_atom_mask"],
                                 multiplicity=diffusion_samples,
                                 max_parallel_samples=max_parallel_samples,
                                 steering_args=getattr(model, 'steering_args', None),
@@ -1074,9 +1331,7 @@ def _make_dap_forward(model):
                         # Grab conf-specific data before offloading dict_out
                         if dap_rank == 0:
                             conf_x_pred = dict_out.get("sample_atom_coords", feats["coords"])
-                            # .contiguous() on [B,N,N] slice (9 MB) so full pdistogram
-                            # [B,N,N,64] (590 MB) can be freed by CPU offload
-                            conf_pdist = dict_out["pdistogram"][:, :, :, 0].contiguous()
+                            conf_pdist = dict_out["pdistogram"][:, :, :, 0]
                         else:
                             conf_x_pred = torch.empty(0)
                             conf_pdist = torch.empty(0)
@@ -1104,6 +1359,7 @@ def _make_dap_forward(model):
                             z_holder = [z_cpu]
                         else:
                             z_holder = [None]
+                        predict_args = getattr(model, "predict_args", {}) or {}
                         confidence_output = run_confidence_dap(
                             model,
                             s_inputs=s_inputs,
@@ -1115,6 +1371,8 @@ def _make_dap_forward(model):
                             multiplicity=diffusion_samples,
                             run_sequentially=run_confidence_sequentially,
                             use_kernels=model.use_kernels,
+                            write_full_pae=bool(predict_args.get("write_full_pae", True)),
+                            write_full_pde=bool(predict_args.get("write_full_pde", True)),
                         )
                         # Release remaining local GPU refs
                         del s, s_inputs, conf_x_pred, conf_pdist, z_holder
@@ -1141,6 +1399,7 @@ def _make_dap_forward(model):
                         # Move any CPU-offloaded tensors back to GPU for writer.
                         # Keep large confidence tensors on CPU to avoid OOM (e.g. hexamer 13 samples).
                         _confidence_cpu_keys = frozenset({
+                            "z", "pdistogram",
                             "pae_logits", "pde_logits", "pde", "pae", "plddt",
                             "complex_pde", "complex_pae", "complex_plddt", "complex_iplddt", "complex_ipde",
                             "ptm", "iptm", "ligand_iptm", "protein_iptm",
@@ -1369,12 +1628,21 @@ def _run_template_dap(tmpl_module, z_scattered, feats, pair_mask, use_kernels, o
     # Set chunk size
     if not tmpl_module.pairformer.training:
         if original_N > const.chunk_size_threshold:
+            chunk_size_transition_z = int(os.environ.get("BOLTZ_TRANSITION_Z_CHUNK", "64"))
+            if chunk_size_transition_z <= 0:
+                chunk_size_transition_z = None
             # For very long sequences, use even smaller chunks to prevent OOM
             # Q@K^T shape: [chunk, H, N, N] × 4 bytes
-            chunk_size_tri_attn = 8 if original_N > 2000 else 32
+            chunk_size_tri_attn = _tri_attn_chunk_size(
+                original_N,
+                default_long=8,
+                default_small=32,
+            )
         else:
+            chunk_size_transition_z = None
             chunk_size_tri_attn = 128
     else:
+        chunk_size_transition_z = None
         chunk_size_tri_attn = None
 
     pf_input = v
@@ -1435,26 +1703,44 @@ def _run_template_dap(tmpl_module, z_scattered, feats, pair_mask, use_kernels, o
 
         # 3. tri_att_start (already DAP-wrapped via DAPPairformerNoSeqLayer injection)
         dropout = _pfnoseq_dropout(layer.dropout, pf_input, layer.training)
-        pf_input = pf_input + dropout * layer.tri_att_start(
-            pf_input, mask=pair_mask_tmpl, chunk_size=chunk_size_tri_attn,
-            use_kernels=_tmpl_use_kernels,
-        )
+        if dap_size > 1:
+            pf_input = layer.tri_att_start.forward_with_residual(
+                pf_input,
+                pair_mask_tmpl,
+                dropout,
+                chunk_size=chunk_size_tri_attn,
+                use_kernels=_tmpl_use_kernels,
+            )
+        else:
+            pf_input = pf_input + dropout * layer.tri_att_start(
+                pf_input, mask=pair_mask_tmpl, chunk_size=chunk_size_tri_attn,
+                use_kernels=_tmpl_use_kernels,
+            )
         if mem_log:
             mem_log(f"  template: PF[{_li}] after tri_att_start")
         _save_subop_gather("after_tri_att_start", pf_input, _li)
 
         # 4. tri_att_end (already DAP-wrapped via DAPPairformerNoSeqLayer injection)
         dropout = _pfnoseq_dropout(layer.dropout, pf_input, layer.training, columnwise=True)
-        pf_input = pf_input + dropout * layer.tri_att_end(
-            pf_input, mask=pair_mask_tmpl, chunk_size=chunk_size_tri_attn,
-            use_kernels=_tmpl_use_kernels,
-        )
+        if dap_size > 1:
+            pf_input = layer.tri_att_end.forward_with_residual(
+                pf_input,
+                pair_mask_tmpl,
+                dropout,
+                chunk_size=chunk_size_tri_attn,
+                use_kernels=_tmpl_use_kernels,
+            )
+        else:
+            pf_input = pf_input + dropout * layer.tri_att_end(
+                pf_input, mask=pair_mask_tmpl, chunk_size=chunk_size_tri_attn,
+                use_kernels=_tmpl_use_kernels,
+            )
         if mem_log:
             mem_log(f"  template: PF[{_li}] after tri_att_end")
         _save_subop_gather("after_tri_att_end", pf_input, _li)
 
         # 5. transition_z
-        pf_input = pf_input + layer.transition_z(pf_input)
+        pf_input = pf_input + layer.transition_z(pf_input, chunk_size_transition_z)
         if mem_log:
             mem_log(f"  template: PF[{_li}] after transition")
         _save_subop_gather("after_transition", pf_input, _li)
@@ -1570,18 +1856,28 @@ def _run_msa_dap(msa_module, z_scattered, s_inputs, feats, full_pair_mask, use_k
 
     z_scattered: [B, N/dap, N, D]
     """
+    torch.cuda.empty_cache()
+    if mem_log:
+        mem_log("before MSA feature preparation (after cache release)")
+
     # Set chunk sizes (same logic as original, with OOM-safe overrides)
     N = z_scattered.shape[2]  # full N
     if not msa_module.training:
         from boltz.data import const
         if N > const.chunk_size_threshold:
             chunk_heads_pwa = True
-            chunk_size_transition_z = 64
+            chunk_size_transition_z = int(os.environ.get("BOLTZ_TRANSITION_Z_CHUNK", "64"))
+            if chunk_size_transition_z <= 0:
+                chunk_size_transition_z = None
             chunk_size_transition_msa = 32
             chunk_size_outer_product = 4
             # For very long sequences, reduce tri_att chunk to prevent
             # Q@K^T score matrix OOM: [chunk, H, N, N] × 4 bytes
-            chunk_size_tri_attn = 16 if N > 2000 else 128
+            chunk_size_tri_attn = _tri_attn_chunk_size(
+                N,
+                default_long=16,
+                default_small=128,
+            )
         else:
             chunk_heads_pwa = False
             chunk_size_transition_z = None
@@ -1598,7 +1894,6 @@ def _run_msa_dap(msa_module, z_scattered, s_inputs, feats, full_pair_mask, use_k
     # Prepare MSA features
     from boltz.data import const
     msa = feats["msa"]
-    msa = torch.nn.functional.one_hot(msa, num_classes=const.num_tokens)
     has_deletion = feats["has_deletion"].unsqueeze(-1)
     deletion_value = feats["deletion_value"].unsqueeze(-1)
     is_paired = feats["msa_paired"].unsqueeze(-1)
@@ -1606,18 +1901,34 @@ def _run_msa_dap(msa_module, z_scattered, s_inputs, feats, full_pair_mask, use_k
     token_mask = feats["token_pad_mask"].float()
     token_mask_2d = token_mask[:, :, None] * token_mask[:, None, :]
 
-    if msa_module.use_paired_feature:
-        m = torch.cat([msa, has_deletion, deletion_value, is_paired], dim=-1)
-    else:
-        m = torch.cat([msa, has_deletion, deletion_value], dim=-1)
-
     if msa_module.subsample_msa:
         msa_indices = torch.randperm(msa.shape[1])[:msa_module.num_subsampled_msa]
-        m = m[:, msa_indices]
+        msa = msa[:, msa_indices]
+        has_deletion = has_deletion[:, msa_indices]
+        deletion_value = deletion_value[:, msa_indices]
+        is_paired = is_paired[:, msa_indices]
         msa_mask = msa_mask[:, msa_indices]
 
-    m = msa_module.msa_proj(m)
-    m = m + msa_module.s_proj(s_inputs).unsqueeze(1)
+    projection_sequence_chunk = (
+        _env_positive_int("BOLTZ_MSA_PROJECTION_S_CHUNK") or 4
+    )
+    m_projected = _project_msa_features_chunked(
+        msa_module.msa_proj,
+        msa,
+        has_deletion,
+        deletion_value,
+        is_paired,
+        msa_module.use_paired_feature,
+        const.num_tokens,
+        projection_sequence_chunk,
+    )
+    del msa, has_deletion, deletion_value, is_paired
+    if msa_module.training and torch.is_grad_enabled():
+        m = m_projected + msa_module.s_proj(s_inputs).unsqueeze(1)
+    else:
+        m = m_projected
+        m.add_(msa_module.s_proj(s_inputs).unsqueeze(1))
+    del m_projected
 
     # Run MSA blocks with DAP layers
     for i in range(msa_module.msa_blocks):
@@ -1659,6 +1970,11 @@ def _run_msa_dap(msa_module, z_scattered, s_inputs, feats, full_pair_mask, use_k
         if mem_log:
             mem_log(f"  msa_module.layer[{i}]")
 
+        if os.environ.get("BOLTZ_MSA_EMPTY_CACHE_BETWEEN_BLOCKS", "0") == "1":
+            torch.cuda.empty_cache()
+            if mem_log:
+                mem_log(f"  msa_module.layer[{i}] after empty_cache")
+
     return z_scattered
 
 
@@ -1677,12 +1993,21 @@ def _run_pairformer_dap(pf_module, s, z_scattered, mask, full_pair_mask, use_ker
     if not pf_module.training:
         from boltz.data import const
         if N > const.chunk_size_threshold:
+            chunk_size_transition_z = int(os.environ.get("BOLTZ_TRANSITION_Z_CHUNK", "64"))
+            if chunk_size_transition_z <= 0:
+                chunk_size_transition_z = None
             # Reduce chunk size for very long sequences to prevent OOM
             # in Q@K^T attention score computation
-            chunk_size_tri_attn = 16 if N > 2000 else 128
+            chunk_size_tri_attn = _tri_attn_chunk_size(
+                N,
+                default_long=16,
+                default_small=128,
+            )
         else:
+            chunk_size_transition_z = None
             chunk_size_tri_attn = 512
     else:
+        chunk_size_transition_z = None
         chunk_size_tri_attn = None
 
     # Per-layer checkpoint saving (controlled by env var)
@@ -1696,6 +2021,7 @@ def _run_pairformer_dap(pf_module, s, z_scattered, mask, full_pair_mask, use_ker
         s, z_scattered = layer(
             s, z_scattered, mask, pair_mask_scattered,
             chunk_size_tri_attn=chunk_size_tri_attn,
+            chunk_size_transition_z=chunk_size_transition_z,
             use_kernels=use_kernels,
             layer_idx=i,
         )

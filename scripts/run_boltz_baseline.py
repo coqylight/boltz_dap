@@ -34,6 +34,8 @@ import torch
 @click.option("--diffusion_samples", type=int, default=1)
 @click.option("--use_msa_server", is_flag=True)
 @click.option("--seed", type=int, default=None, help="Random seed for deterministic runs")
+@click.option("--save_trunk_checkpoints", is_flag=True)
+@click.option("--save_granular_checkpoints", is_flag=True)
 def main(
     data: str,
     out_dir: str,
@@ -43,6 +45,8 @@ def main(
     diffusion_samples: int = 1,
     use_msa_server: bool = False,
     seed: int = None,
+    save_trunk_checkpoints: bool = False,
+    save_granular_checkpoints: bool = False,
 ):
     """Run original Boltz2 on single GPU with z/s saving."""
 
@@ -161,20 +165,81 @@ def main(
     model = model.to(device)
     print(f"  ✓ Model loaded to {device}")
 
+    _granular_checkpoints = {}
+    if save_granular_checkpoints:
+        msa_layer = model.msa_module.layers[0]
+
+        def _msa_layer_pre_hook(module, args):
+            del module
+            if "msa/blk0/before_opm_z" not in _granular_checkpoints:
+                _granular_checkpoints["msa/blk0/before_opm_z"] = (
+                    args[0].detach().cpu().to(torch.bfloat16)
+                )
+
+        def _msa_transition_hook(module, args, output):
+            del module
+            if "msa/blk0/after_pwa_and_transition_m" not in _granular_checkpoints:
+                _granular_checkpoints["msa/blk0/after_pwa_and_transition_m"] = (
+                    (args[0] + output).detach().cpu().to(torch.bfloat16)
+                )
+
+        def _msa_pairformer_pre_hook(module, args):
+            del module
+            if "msa/blk0/after_opm" not in _granular_checkpoints:
+                _granular_checkpoints["msa/blk0/after_opm"] = (
+                    args[0].detach().cpu().to(torch.bfloat16)
+                )
+
+        def _msa_pairformer_hook(module, args, output):
+            del module, args
+            if "msa/blk0/after_pf" not in _granular_checkpoints:
+                _granular_checkpoints["msa/blk0/after_pf"] = (
+                    output[0].detach().cpu().to(torch.bfloat16)
+                )
+
+        msa_layer.register_forward_pre_hook(_msa_layer_pre_hook)
+        msa_layer.msa_transition.register_forward_hook(_msa_transition_hook)
+        msa_layer.pairformer_layer.register_forward_pre_hook(_msa_pairformer_pre_hook)
+        msa_layer.pairformer_layer.register_forward_hook(_msa_pairformer_hook)
+
     # Hook to intercept z/s after trunk
     _captured = {}
+    _trunk_checkpoints = {}
+    _recycle_index = [0]
     _orig_distogram_forward = model.distogram_module.forward
     def _hook_distogram(z):
         _captured['z'] = z.detach().cpu()
         return _orig_distogram_forward(z)
     model.distogram_module.forward = _hook_distogram
 
-    # Also hook s through s_post_norm or pairformer output
-    # The pairformer_module.forward returns (s, z), and s is used later
+    _orig_msa_forward = model.msa_module.forward
+    def _hook_msa(z, *args, **kwargs):
+        recycle_index = _recycle_index[0]
+        if save_trunk_checkpoints:
+            _trunk_checkpoints[f"R{recycle_index}/after_recycle"] = {
+                "z": z.detach().cpu().to(torch.bfloat16),
+            }
+        return _orig_msa_forward(z, *args, **kwargs)
+    model.msa_module.forward = _hook_msa
+
+    # The pairformer input is the post-MSA residual and its output is the
+    # final trunk state for this recycle.
     _orig_pf_forward = model.pairformer_module.forward
     def _hook_pf(*args, **kwargs):
+        recycle_index = _recycle_index[0]
+        if save_trunk_checkpoints:
+            _trunk_checkpoints[f"R{recycle_index}/after_msa"] = {
+                "s": args[0].detach().cpu().to(torch.bfloat16),
+                "z": args[1].detach().cpu().to(torch.bfloat16),
+            }
         s, z = _orig_pf_forward(*args, **kwargs)
         _captured['s_pf'] = s.detach().cpu()
+        if save_trunk_checkpoints:
+            _trunk_checkpoints[f"R{recycle_index}/after_pairformer"] = {
+                "s": s.detach().cpu().to(torch.bfloat16),
+                "z": z.detach().cpu().to(torch.bfloat16),
+            }
+        _recycle_index[0] += 1
         return s, z
     model.pairformer_module.forward = _hook_pf
 
@@ -255,6 +320,16 @@ def main(
             print(f"  ✓ Saved z/s to {zs_path}")
             for k, v in zs_data.items():
                 print(f"    {k}: shape={list(v.shape)}, mean={v.float().mean():.4f}, std={v.float().std():.4f}")
+
+        if save_trunk_checkpoints:
+            checkpoint_path = out_dir / "trunk_checkpoints.pt"
+            torch.save(_trunk_checkpoints, checkpoint_path)
+            print(f"  ✓ Saved {len(_trunk_checkpoints)} trunk checkpoints to {checkpoint_path}")
+
+        if save_granular_checkpoints:
+            granular_path = out_dir / "granular_ckpts.pt"
+            torch.save(_granular_checkpoints, granular_path)
+            print(f"  ✓ Saved {len(_granular_checkpoints)} granular checkpoints to {granular_path}")
 
     # Check output
     print(f"\n[5/5] Checking output...")

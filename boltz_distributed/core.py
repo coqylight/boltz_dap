@@ -98,12 +98,19 @@ def init_dap(dap_size=None):
             set_missing_distributed_environ('MASTER_PORT', 18417)
             
             from datetime import timedelta
-            nccl_timeout = int(os.environ.get('NCCL_TIMEOUT', 7200))
-            torch.distributed.init_process_group(
+            nccl_timeout = int(os.environ.get('NCCL_TIMEOUT', 43200))
+            init_kwargs = dict(
                 backend='nccl',
                 init_method='env://',
-                timeout=timedelta(seconds=nccl_timeout),  # default 2h — --no_kernels diffusion can take >45 min
+                timeout=timedelta(seconds=nccl_timeout),  # default 12h for long rank-0 phases
             )
+            try:
+                torch.distributed.init_process_group(
+                    **init_kwargs,
+                    device_id=torch.device(f"cuda:{local_rank}"),
+                )
+            except TypeError:
+                torch.distributed.init_process_group(**init_kwargs)
         
         _DAP_SIZE = torch.distributed.get_world_size()
         _DAP_RANK = torch.distributed.get_rank()

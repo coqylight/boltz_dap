@@ -288,14 +288,14 @@ def test_opm(model):
 
 def test_pwa(model):
     """Test pair-weighted averaging."""
-    from dap_msa import _pwa_with_bias
+    from dap_msa import _pwa_scattered_streamed, _pwa_with_bias
 
     msa_mod = model.msa_module
     if hasattr(msa_mod, '_orig_mod'):
         msa_mod = msa_mod._orig_mod
 
     pwa = msa_mod.layers[0].pair_weighted_averaging
-    D_z = pwa.proj_z[0].normalized_shape[0]  # LayerNorm inside proj_z Sequential
+    D_z = pwa.norm_z.normalized_shape[0]
     N = 64
     S = 16
 
@@ -323,6 +323,17 @@ def test_pwa(model):
         dap = _pwa_with_bias(pwa, m_normed, b_full, token_mask, chunk_heads=False)
 
         compare("pwa", orig, dap)
+
+        old_q_chunk = os.environ.get("BOLTZ_PWA_Q_CHUNK")
+        os.environ["BOLTZ_PWA_Q_CHUNK"] = "7"
+        try:
+            dap_streamed = _pwa_scattered_streamed(pwa, m_normed, z_scat, token_mask)
+            compare("pwa_streamed(q=7)", orig, dap_streamed)
+        finally:
+            if old_q_chunk is None:
+                os.environ.pop("BOLTZ_PWA_Q_CHUNK", None)
+            else:
+                os.environ["BOLTZ_PWA_Q_CHUNK"] = old_q_chunk
 
 
 def main():
@@ -358,6 +369,14 @@ def main():
     )
     model.eval()
     rank_print("Model loaded.\n")
+
+    test_only = os.environ.get("DAP_LAYER_TEST_ONLY", "").strip().lower()
+    if test_only == "pwa":
+        test_pwa(model)
+        if dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
+        return
 
     test_pairformer_noseq(model)
     test_pairformer_with_seq(model)
