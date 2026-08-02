@@ -16,7 +16,7 @@ from typing import Optional
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
-from boltz_distributed.comm import row_to_col, col_to_row
+from boltz_distributed.comm import row_to_col, col_to_row, col_to_row_inplace
 from boltz_distributed.core import get_dap_size, get_dap_rank
 
 from dap_trimul import DAPTriMulOut, DAPTriMulIn
@@ -78,6 +78,7 @@ class DAPPairformerNoSeqLayer(nn.Module):
         use_kernels: bool = False,
         use_cuequiv_mul: bool = False,
         use_cuequiv_attn: bool = False,
+        chunk_size_transition_z: Optional[int] = None,
     ) -> Tensor:
         """Forward: z [B, N/dap, N, D], pair_mask [B, N/dap, N]."""
         original_N = z.shape[2]
@@ -98,15 +99,28 @@ class DAPPairformerNoSeqLayer(nn.Module):
             torch.cuda.reset_peak_memory_stats(0)
             return alloc
 
+        def _floor(label):
+            if not _diag:
+                return
+            torch.cuda.synchronize()
+            alloc = torch.cuda.memory_allocated(0) // (1024*1024)
+            reserved = torch.cuda.memory_reserved(0) // (1024*1024)
+            free, total = torch.cuda.mem_get_info(0)
+            print(f"        [PF-FLOOR] {label:22s} | alloc={alloc}MB | reserved={reserved}MB | "
+                  f"free={free // (1024*1024)}/{total // (1024*1024)}MB", flush=True)
+
         def _post(label, alloc_before):
             if not _diag:
                 return
             torch.cuda.synchronize()
             alloc_after = torch.cuda.memory_allocated(0) // (1024*1024)
+            reserved = torch.cuda.memory_reserved(0) // (1024*1024)
+            free, total = torch.cuda.mem_get_info(0)
             peak = torch.cuda.max_memory_allocated(0) // (1024*1024)
             transient = peak - alloc_before
             print(f"        [PF-OP] {label:16s} | alloc: {alloc_before}→{alloc_after}MB "
-                  f"(Δ{alloc_after - alloc_before:+d}) | peak={peak}MB | TRANSIENT={transient}MB",
+                  f"(Δ{alloc_after - alloc_before:+d}) | reserved={reserved}MB | "
+                  f"free={free // (1024*1024)}/{total // (1024*1024)}MB | peak={peak}MB | TRANSIENT={transient}MB",
                   flush=True)
 
         def _save_checkpoint(label, z_scat):
@@ -124,7 +138,7 @@ class DAPPairformerNoSeqLayer(nn.Module):
         # 1. TriMulOut: row-scattered
         a0 = _pre()
         dropout = get_dropout_mask(self.dropout, z, self.training)
-        z = z + dropout * self.tri_mul_out(z, mask=pair_mask, use_kernels=use_kernels)
+        z = self.tri_mul_out.forward_with_residual(z, pair_mask, dropout, use_kernels=use_kernels)
         _post("tri_mul_out", a0)
         _save_checkpoint("after_tri_mul_out", z)
 
@@ -139,19 +153,24 @@ class DAPPairformerNoSeqLayer(nn.Module):
             z_col[:, original_N:, :, :] = 0
             pair_mask_col[:, original_N:, :] = 0
         dropout = get_dropout_mask(self.dropout, z_col, self.training)
-        z_col = z_col + dropout * self.tri_mul_in(z_col, mask=pair_mask_col, use_kernels=use_kernels)
-        z = col_to_row(z_col)
-        del z_col
+        z_col = self.tri_mul_in.forward_with_residual(z_col, pair_mask_col, dropout, use_kernels=use_kernels)
+        if not self.training and not torch.is_grad_enabled():
+            col_to_row_inplace(z_col, z)
+        else:
+            z = col_to_row(z_col)
+        del z_col, pair_mask_col, dropout
         if z.shape[2] > original_N:
             z = z[:, :, :original_N, :]
+        _floor("after tri_mul_in cleanup")
         _post("tri_mul_in", a0)
         _save_checkpoint("after_tri_mul_in", z)
 
         # 3. TriAttStart: scattered, gathers only bias (H=4 channels)
+        _floor("before tri_att_start")
         a0 = _pre()
         dropout = get_dropout_mask(self.dropout, z, self.training)
-        z = z + dropout * self.tri_att_start(
-            z, mask=pair_mask, chunk_size=chunk_size_tri_attn, use_kernels=use_kernels,
+        z = self.tri_att_start.forward_with_residual(
+            z, pair_mask, dropout, chunk_size=chunk_size_tri_attn, use_kernels=use_kernels,
         )
         _post("tri_att_start", a0)
         _save_checkpoint("after_tri_att_start", z)
@@ -159,15 +178,18 @@ class DAPPairformerNoSeqLayer(nn.Module):
         # 4. TriAttEnd: internally uses row_to_col, gathers only bias
         a0 = _pre()
         dropout = get_dropout_mask(self.dropout, z, self.training, columnwise=True)
-        z = z + dropout * self.tri_att_end(
-            z, mask=pair_mask, chunk_size=chunk_size_tri_attn, use_kernels=use_kernels,
+        z = self.tri_att_end.forward_with_residual(
+            z, pair_mask, dropout, chunk_size=chunk_size_tri_attn, use_kernels=use_kernels,
         )
         _post("tri_att_end", a0)
         _save_checkpoint("after_tri_att_end", z)
 
         # 5. Transition (pointwise)
         a0 = _pre()
-        z = z + self.transition_z(z)
+        if not self.training and not torch.is_grad_enabled():
+            z.add_(self.transition_z(z, chunk_size_transition_z))
+        else:
+            z = z + self.transition_z(z, chunk_size_transition_z)
         _post("transition_z", a0)
         _save_checkpoint("after_transition", z)
 

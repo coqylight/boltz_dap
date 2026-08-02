@@ -18,6 +18,7 @@ Requirements:
 
 import os
 import sys
+import traceback
 import warnings
 import threading
 import time
@@ -31,6 +32,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import click
 import torch
 import torch.distributed as dist
+
+
+def _missing_boltz2_cache_files(cache: Path, canonical_tokens) -> list[Path]:
+    required = [cache / "boltz2_conf.ckpt"]
+    required.extend(cache / "mols" / f"{token}.pkl" for token in canonical_tokens)
+    return [path for path in required if not path.is_file()]
 
 
 def _process_ram_mb() -> tuple[int | None, int | None, int | None]:
@@ -91,7 +98,7 @@ class GPUMonitor:
 
     def start(self):
         self.running = True
-        self.thread = threading.Thread(target=self._monitor)
+        self.thread = threading.Thread(target=self._monitor, daemon=True)
         self.thread.start()
 
     def stop(self):
@@ -140,6 +147,7 @@ class GPUMonitor:
 @click.option("--sampling_steps", type=int, default=200)
 @click.option("--diffusion_samples", type=int, default=1)
 @click.option("--use_msa_server", is_flag=True)
+@click.option("--msa-server-url", default="https://api.colabfold.com", show_default=True)
 @click.option("--no_kernels", is_flag=True, help="Disable cuequivariance CUDA kernels (use PyTorch-native ops)")
 @click.option("--use_flex_attention", is_flag=True, help="Use FlexAttention for triangle attention (memory/throughput)")
 @click.option("--use_flex_attention_chunked", is_flag=True, help="Use chunked FlexAttention for DAP (experimental; avoids 112GB OOM)")
@@ -166,6 +174,7 @@ class GPUMonitor:
 @click.option("--dc_pairwise_chunk_size", type=int, default=512, help="Row chunk size for diffusion pairwise conditioner")
 @click.option("--dc_token_bias_chunk_size", type=int, default=256, help="Row chunk size for diffusion token_trans_bias")
 @click.option("--dc_atom_encoder_chunk_size", type=int, default=256, help="Row chunk size for diffusion atom encoder z_to_p")
+@click.option("--dc_atom_window_chunk_size", type=int, default=16, help="Atom-window chunk size for diffusion atom encoder z_to_p")
 @click.option(
     "--keep_pde_logits",
     is_flag=True,
@@ -173,6 +182,13 @@ class GPUMonitor:
 )
 @click.option("--seed", type=int, default=None, help="Random seed for deterministic runs")
 @click.option("--skip_processing", is_flag=True, help="Reuse existing out_dir/processed without running process_inputs")
+@click.option(
+    "--nccl-timeout-seconds",
+    type=int,
+    default=43200,
+    show_default=True,
+    help="Process-group timeout for long rank-0 preprocessing and diffusion phases.",
+)
 @click.option(
     "--template-t-chunk-size",
     type=int,
@@ -187,6 +203,7 @@ def main(
     sampling_steps: int = 200,
     diffusion_samples: int = 1,
     use_msa_server: bool = False,
+    msa_server_url: str = "https://api.colabfold.com",
     no_kernels: bool = False,
     use_flex_attention: bool = False,
     use_flex_attention_chunked: bool = False,
@@ -198,12 +215,16 @@ def main(
     dc_pairwise_chunk_size: int = 512,
     dc_token_bias_chunk_size: int = 256,
     dc_atom_encoder_chunk_size: int = 256,
+    dc_atom_window_chunk_size: int = 16,
     keep_pde_logits: bool = False,
     seed: int = None,
     skip_processing: bool = False,
+    nccl_timeout_seconds: int = 43200,
     template_t_chunk_size: int | None = None,
 ):
     """Run Boltz 2 with proper FastFold-style DAP (no model duplication)."""
+
+    os.environ.setdefault("NCCL_TIMEOUT", str(nccl_timeout_seconds))
 
     # Initialize DAP
     from boltz_distributed import init_dap, get_dap_size, get_dap_rank
@@ -248,6 +269,7 @@ def main(
     _os.environ['BOLTZ_DC_PAIRWISE_CHUNK'] = str(dc_pairwise_chunk_size)
     _os.environ['BOLTZ_DC_TOKEN_BIAS_CHUNK'] = str(dc_token_bias_chunk_size)
     _os.environ['BOLTZ_DC_ATOM_ENCODER_CHUNK'] = str(dc_atom_encoder_chunk_size)
+    _os.environ['BOLTZ_DC_ATOM_WINDOW_CHUNK'] = str(dc_atom_window_chunk_size)
     _os.environ['BOLTZ_DAP_KEEP_PDE_LOGITS'] = "1" if keep_pde_logits else "0"
     log_file = out_dir / "gpu_memory.log"
 
@@ -260,14 +282,16 @@ def main(
     rank_print(f"{'='*70}")
     rank_print(f"Input: {data}")
     rank_print(f"Output: {out_dir}")
-    rank_print("No model duplication — activations sharded across GPUs")
+    rank_print(f"Cache: {cache}")
+    rank_print(f"No model duplication — activations sharded across GPUs")
     rank_print(
         "Trunk checkpoints: "
         + ("on" if save_trunk_checkpoints else "off")
         + " | granular checkpoints: "
         + ("on" if save_granular_checkpoints else "off")
         + f" | diffusion chunks: pw={dc_pairwise_chunk_size},"
-        + f" ttb={dc_token_bias_chunk_size}, ae={dc_atom_encoder_chunk_size}"
+        + f" ttb={dc_token_bias_chunk_size}, ae={dc_atom_encoder_chunk_size},"
+        + f" aew={dc_atom_window_chunk_size}"
     )
     rank_print(f"{'='*70}\n")
 
@@ -293,6 +317,7 @@ def main(
         filter_inputs_structure,
     )
     from boltz.model.models.boltz2 import Boltz2
+    from boltz.data import const
     from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
     from boltz.data.types import Manifest
     from boltz.data.write.writer import BoltzWriter
@@ -312,35 +337,70 @@ def main(
     mol_dir = cache / "mols"
 
     processed_manifest = out_dir / "processed" / "manifest.json"
+    preprocessing_exception = None
+    preprocessing_traceback = None
     if dap_rank == 0:
-        if skip_processing:
-            if not processed_manifest.exists():
+        try:
+            required_tokens = () if skip_processing else const.canonical_tokens
+            missing_cache_files = _missing_boltz2_cache_files(cache, required_tokens)
+            if missing_cache_files:
+                missing = ", ".join(str(path.relative_to(cache)) for path in missing_cache_files)
                 raise FileNotFoundError(
-                    f"--skip_processing was set, but processed manifest was not found: {processed_manifest}"
+                    f"Incomplete Boltz2 cache at {cache}; missing required files: {missing}"
                 )
-            rank_print("  ✓ Reusing existing processed inputs (skip_processing=True)")
-        else:
-            process_inputs(
-                data=[data],
-                out_dir=out_dir,
-                ccd_path=ccd_path,
-                mol_dir=mol_dir,
-                use_msa_server=use_msa_server,
-                msa_server_url="https://api.colabfold.com",
-                msa_pairing_strategy="greedy",
-                boltz2=True,
-                preprocessing_threads=1,
-                max_msa_seqs=8192,
-            )
 
-    dist_barrier()
+            if skip_processing:
+                if not processed_manifest.exists():
+                    raise FileNotFoundError(
+                        f"--skip_processing was set, but processed manifest was not found: {processed_manifest}"
+                    )
+                rank_print("  ✓ Reusing existing processed inputs (skip_processing=True)")
+            else:
+                process_inputs(
+                    data=[data],
+                    out_dir=out_dir,
+                    ccd_path=ccd_path,
+                    mol_dir=mol_dir,
+                    use_msa_server=use_msa_server,
+                    msa_server_url=msa_server_url,
+                    msa_pairing_strategy="greedy",
+                    boltz2=True,
+                    preprocessing_threads=1,
+                    max_msa_seqs=8192,
+                )
+        except Exception as exc:  # noqa: BLE001
+            preprocessing_exception = exc
+            preprocessing_traceback = traceback.format_exc()
+            print("Rank 0 preprocessing failed:\n" + preprocessing_traceback, flush=True)
+
+    preprocessing_failed = torch.tensor(
+        [int(preprocessing_exception is not None)], dtype=torch.int32, device=device
+    )
+    dist.broadcast(preprocessing_failed, src=0)
+    if preprocessing_failed.item():
+        if monitor is not None:
+            monitor.stop()
+        dist.destroy_process_group()
+        if dap_rank == 0:
+            raise RuntimeError("Rank 0 preprocessing failed; see traceback above.") from preprocessing_exception
+        raise RuntimeError("Rank 0 preprocessing failed; see the rank 0 traceback.")
 
     # Load manifest
     manifest = Manifest.load(out_dir / "processed" / "manifest.json")
+    if not manifest.records:
+        if monitor is not None:
+            monitor.stop()
+        dist.destroy_process_group()
+        raise RuntimeError(
+            f"Preprocessing produced no records for {data}; inspect the rank 0 errors above."
+        )
+
     filtered_manifest = filter_inputs_structure(manifest=manifest, outdir=out_dir)
 
     if not filtered_manifest.records:
         rank_print("No predictions needed.")
+        if monitor is not None:
+            monitor.stop()
         dist.destroy_process_group()
         return
 
@@ -404,7 +464,6 @@ def main(
             n_patched = patch_triangle_attention(model)
             rank_print(f"  ✓ FlexAttention (chunked) patched onto {n_patched} TriangleAttention layers")
         except Exception as e:
-            import traceback
             rank_print(f"  ⚠ FlexAttention chunked patch skipped: {e}")
             traceback.print_exc()
             sys.stdout.flush()
@@ -415,7 +474,6 @@ def main(
             n_patched = patch_triangle_attention(model)
             rank_print(f"  ✓ FlexAttention patched onto {n_patched} TriangleAttention layers")
         except Exception as e:
-            import traceback
             rank_print(f"  ⚠ FlexAttention patch skipped: {e}")
             rank_print("  FlexAttention patch traceback (to locate 'duplicate template name'):")
             traceback.print_exc()
@@ -515,6 +573,11 @@ def main(
         rank_print(f"  Running batch {batch_idx}...")
         N = batch.get("token_pad_mask", torch.tensor([])).shape[-1] if "token_pad_mask" in batch else 0
         rank_print(f"    Sequence length: {N}")
+        if N >= 8000:
+            current_tri_att_chunk = int(os.environ.get("BOLTZ_TRI_ATT_CHUNK", "0") or "0")
+            if current_tri_att_chunk <= 0 or current_tri_att_chunk > 2:
+                os.environ["BOLTZ_TRI_ATT_CHUNK"] = "2"
+                rank_print("    [OOM-GUARD] BOLTZ_TRI_ATT_CHUNK set to 2 for N>=8000")
         mem_before = torch.cuda.memory_allocated(device) / 1024**2
         rank_print(f"    Memory before forward: {mem_before:.0f} MB")
 

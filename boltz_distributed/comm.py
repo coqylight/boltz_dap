@@ -97,6 +97,64 @@ def _gather(tensor: Tensor, dim: int = -1, original_size: int = None) -> Tensor:
     return output
 
 
+def gather_to_rank0_cpu(tensor: Tensor, dim: int = -1, original_size: int = None) -> Tensor | None:
+    """Gather sharded tensors into CPU memory on rank 0 only.
+
+    Unlike :func:`_gather`, this helper never materializes the full gathered
+    tensor on CUDA and returns ``None`` on non-zero DAP ranks. It is intended
+    for inference handoffs where only rank 0 consumes the full tensor after a
+    DAP-sharded trunk.
+    """
+    dap_size = get_dap_size()
+    if dap_size == 1:
+        output = tensor.detach().cpu()
+        if original_size is not None and output.shape[dim] > original_size:
+            indices = [slice(None)] * output.ndim
+            indices[dim] = slice(0, original_size)
+            output = output[tuple(indices)]
+        return output
+
+    dap_rank = get_dap_rank()
+    group = get_dap_group()
+    dim = dim if dim >= 0 else tensor.ndim + dim
+    local = tensor.detach().contiguous()
+    local_dim = local.shape[dim]
+
+    def _global_rank(rank: int) -> int:
+        if group is None:
+            return rank
+        return dist.get_global_rank(group, rank)
+
+    def _copy_shard(output: Tensor, shard: Tensor, rank: int) -> None:
+        start = rank * local_dim
+        stop = start + local_dim
+        if original_size is not None:
+            stop = min(stop, original_size)
+        if stop <= start:
+            return
+        src_indices = [slice(None)] * shard.ndim
+        dst_indices = [slice(None)] * output.ndim
+        src_indices[dim] = slice(0, stop - start)
+        dst_indices[dim] = slice(start, stop)
+        output[tuple(dst_indices)].copy_(shard[tuple(src_indices)].cpu())
+
+    if dap_rank == 0:
+        output_shape = list(local.shape)
+        output_shape[dim] = local_dim * dap_size
+        if original_size is not None:
+            output_shape[dim] = min(output_shape[dim], original_size)
+        output = torch.empty(output_shape, dtype=local.dtype, device="cpu")
+        _copy_shard(output, local, 0)
+        recv_buf = torch.empty_like(local)
+        for src_rank in range(1, dap_size):
+            dist.recv(recv_buf, src=_global_rank(src_rank), group=group)
+            _copy_shard(output, recv_buf, src_rank)
+        return output
+
+    dist.send(local, dst=_global_rank(0), group=group)
+    return None
+
+
 # Autograd-compatible wrappers with proper gradient handling
 
 class Copy(torch.autograd.Function):
@@ -181,12 +239,21 @@ def _all_to_all(tensor: Tensor, in_dim: int = -1, out_dim: int = -1) -> Tensor:
     if out_dim == 1:
         output_shape = list(input_tensor_list[0].shape)
         output_shape[1] *= dap_size
-        output = torch.empty(output_shape, dtype=tensor.dtype, device=tensor.device)
-        output_tensor_list = output.chunk(dap_size, dim=1)
-        dist.all_to_all(list(output_tensor_list), input_tensor_list, group=group, async_op=False)
+        if output_shape[0] == 1:
+            output = torch.empty(output_shape, dtype=tensor.dtype, device=tensor.device)
+            output_tensor_list = output.chunk(dap_size, dim=1)
+            dist.all_to_all(list(output_tensor_list), input_tensor_list, group=group, async_op=False)
+        else:
+            # Dimension-1 chunks are non-contiguous when a leading batch/template
+            # dimension is greater than one, which NCCL all_to_all rejects.
+            output_tensor_list = [torch.empty_like(t) for t in input_tensor_list]
+            dist.all_to_all(output_tensor_list, input_tensor_list, group=group, async_op=False)
+            del input_tensor_list, tensor
+            output = torch.cat(output_tensor_list, dim=1)
     else:
-        output_tensor_list = [torch.ones_like(t) for t in input_tensor_list]
+        output_tensor_list = [torch.empty_like(t) for t in input_tensor_list]
         dist.all_to_all(output_tensor_list, input_tensor_list, group=group, async_op=False)
+        del input_tensor_list, tensor
         output = torch.cat(output_tensor_list, dim=out_dim)
 
     return output
@@ -254,6 +321,52 @@ def col_to_row(input: Tensor) -> Tensor:
     if torch.is_grad_enabled() and input.requires_grad:
         return All_to_All.apply(input, 1, 2)
     return _all_to_all(input, in_dim=1, out_dim=2)
+
+
+def col_to_row_inplace(input: Tensor, output: Tensor) -> Tensor:
+    """Convert column-distributed input into preallocated row storage."""
+    if torch.is_grad_enabled() and (input.requires_grad or output.requires_grad):
+        raise RuntimeError("col_to_row_inplace does not support autograd")
+
+    dap_size = get_dap_size()
+    if dap_size == 1:
+        output.copy_(input)
+        return output
+
+    if input.device != output.device or input.dtype != output.dtype:
+        raise ValueError("input and output must have the same device and dtype")
+    if input.ndim != output.ndim:
+        raise ValueError("input and output must have the same rank")
+    if input.shape[1] % dap_size != 0:
+        raise ValueError("column-distributed rows must be divisible by DAP size")
+
+    group = get_dap_group()
+    row_split = input.shape[1] // dap_size
+    local_cols = input.shape[2]
+    if output.shape[1] != row_split:
+        raise ValueError(
+            f"output local rows must be {row_split}, got {output.shape[1]}"
+        )
+    if output.shape[2] > local_cols * dap_size:
+        raise ValueError("output has more columns than the distributed input")
+    for dim in (0, *range(3, input.ndim)):
+        if input.shape[dim] != output.shape[dim]:
+            raise ValueError("input and output non-distributed dimensions differ")
+
+    input_parts = [part.contiguous() for part in torch.split(input, row_split, dim=1)]
+    received_parts = [torch.empty_like(part) for part in input_parts]
+    dist.all_to_all(received_parts, input_parts, group=group, async_op=False)
+    del input_parts
+
+    for src_rank, part in enumerate(received_parts):
+        col_start = src_rank * local_cols
+        col_end = min(col_start + local_cols, output.shape[2])
+        if col_end > col_start:
+            output[:, :, col_start:col_end].copy_(
+                part[:, :, : col_end - col_start]
+            )
+    del received_parts
+    return output
 
 
 def row_to_col(input: Tensor) -> Tensor:

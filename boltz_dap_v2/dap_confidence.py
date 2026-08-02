@@ -30,6 +30,11 @@ from dap_pairformer import DAPPairformerLayer
 _DEBUG_CONF_CALL_IDX = [0]
 
 
+def _local_cuda_device() -> torch.device:
+    """Return the process-local CUDA device selected by DAP initialization."""
+    return torch.device("cuda", torch.cuda.current_device())
+
+
 def _process_ram_mb() -> tuple[int | None, int | None, int | None]:
     """Return process RSS plus cgroup memory usage/limit in MB when available."""
     rss_mb = None
@@ -64,6 +69,90 @@ def _dict_tensors_to_cpu(obj):
     if isinstance(obj, dict):
         return {k: _dict_tensors_to_cpu(v) for k, v in obj.items()}
     return obj
+
+
+def _stage_confidence_feats(feats: dict, conf, dap_rank: int) -> dict[str, Tensor]:
+    """Keep only confidence inputs, with one CPU copy on global rank 0."""
+    required = {
+        "asym_id",
+        "atom_pad_mask",
+        "atom_to_token",
+        "frames_idx",
+        "mol_type",
+        "token_pad_mask",
+        "token_to_rep_atom",
+    }
+    if conf.add_z_input_to_z:
+        required.update(
+            {
+                "contact_conditioning",
+                "contact_threshold",
+                "entity_id",
+                "residue_index",
+                "sym_id",
+                "token_bonds",
+                "token_index",
+            }
+        )
+        if conf.bond_type_feature:
+            required.add("type_bonds")
+        if (
+            hasattr(conf, "rel_pos")
+            and hasattr(conf.rel_pos, "cyclic_pos_enc")
+            and conf.rel_pos.cyclic_pos_enc
+        ):
+            required.add("cyclic_period")
+
+    feats_cpu = {}
+    for key, value in list(feats.items()):
+        if not isinstance(value, torch.Tensor):
+            continue
+        if dap_rank == 0 and key in required:
+            cpu_value = value.cpu() if value.is_cuda else value
+            feats[key] = cpu_value
+            feats_cpu[key] = cpu_value
+        else:
+            del feats[key]
+    return feats_cpu
+
+
+def _stream_contact_probability(
+    pred_distogram_logits: Tensor,
+    device: torch.device,
+    row_chunk: int,
+) -> Tensor:
+    """Compute contact probability without materializing full logits on GPU."""
+    batch_size, num_tokens, num_tokens_2, num_bins = pred_distogram_logits.shape
+    if num_tokens != num_tokens_2 or num_bins != 64:
+        raise ValueError(
+            "Expected distogram logits with shape [B, N, N, 64], got "
+            f"{tuple(pred_distogram_logits.shape)}"
+        )
+    row_chunk = max(1, row_chunk)
+    prob_contact = torch.empty(
+        batch_size,
+        num_tokens,
+        num_tokens,
+        dtype=pred_distogram_logits.dtype,
+        device=device,
+    )
+    contacts = torch.zeros(
+        (1, 1, 1, num_bins),
+        dtype=pred_distogram_logits.dtype,
+        device=device,
+    )
+    contacts[:, :, :, :20] = 1.0
+    for row_start in range(0, num_tokens, row_chunk):
+        row_end = min(row_start + row_chunk, num_tokens)
+        logits_rows = pred_distogram_logits[:, row_start:row_end].to(
+            device=device, non_blocking=False
+        )
+        probability_rows = torch.nn.functional.softmax(logits_rows, dim=-1)
+        prob_contact[:, row_start:row_end].copy_(
+            (probability_rows * contacts).sum(-1)
+        )
+        del logits_rows, probability_rows
+    return prob_contact
 
 
 def inject_dap_into_confidence(confidence_module):
@@ -142,6 +231,8 @@ def run_confidence_dap(
     multiplicity: int = 1,
     run_sequentially: bool = True,
     use_kernels: bool = False,
+    write_full_pae: bool = True,
+    write_full_pde: bool = True,
 ):
     """Run the confidence module with DAP on ALL operations.
 
@@ -153,6 +244,7 @@ def run_confidence_dap(
     dap_size = get_dap_size()
     dap_rank = get_dap_rank()
     conf = model.confidence_module
+    local_device = _local_cuda_device()
 
     def _barrier() -> None:
         try:
@@ -178,6 +270,7 @@ def run_confidence_dap(
             out_0 = run_confidence_dap(
                 model, s_inputs, s, z, x_pred_0, feats, pred_distogram_logits,
                 multiplicity=1, run_sequentially=False, use_kernels=use_kernels,
+                write_full_pae=write_full_pae, write_full_pde=write_full_pde,
             )
             # Keep merged on CPU so GPU only holds one confidence run at a time (avoids OOM on hexamer).
             merged = {}
@@ -207,6 +300,7 @@ def run_confidence_dap(
                 out_i = run_confidence_dap(
                     model, s_inputs, s, z, x_pred_i, feats, pred_distogram_logits,
                     multiplicity=1, run_sequentially=False, use_kernels=use_kernels,
+                    write_full_pae=write_full_pae, write_full_pde=write_full_pde,
                 )
                 for key in out_i:
                     vali = out_i[key]
@@ -248,18 +342,23 @@ def run_confidence_dap(
                 run_confidence_dap(
                     model, s_inputs, s, z, x_pred_i, feats, pred_distogram_logits,
                     multiplicity=1, run_sequentially=False, use_kernels=use_kernels,
+                    write_full_pae=write_full_pae, write_full_pde=write_full_pde,
                 )
             return {}
 
     # ── Memory logging helper ──────────────────────────────────────────
     import time as _time
     _conf_t0 = _time.time()
+    _conf_diag = os.environ.get("BOLTZ_CONFIDENCE_DIAG", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
     def _cmem(label):
-        torch.cuda.synchronize()
-        dev = dap_rank
-        alloc = torch.cuda.memory_allocated(dev) // (1024 * 1024)
-        resv = torch.cuda.memory_reserved(dev) // (1024 * 1024)
-        free_cuda, total_cuda = torch.cuda.mem_get_info(dev)
+        if not _conf_diag:
+            return
+        torch.cuda.synchronize(local_device)
+        alloc = torch.cuda.memory_allocated(local_device) // (1024 * 1024)
+        resv = torch.cuda.memory_reserved(local_device) // (1024 * 1024)
+        free_cuda, total_cuda = torch.cuda.mem_get_info(local_device)
         free_mb = free_cuda // (1024 * 1024)
         elapsed = _time.time() - _conf_t0
         rss_mb, cgroup_used_mb, cgroup_limit_mb = _process_ram_mb()
@@ -272,6 +371,19 @@ def run_confidence_dap(
         print(f"    [CONF R{dap_rank}]  {elapsed:6.1f}s | alloc={alloc:6d}MB | resv={resv:6d}MB | free={free_mb:6d}MB{ram} | {label}", flush=True)
 
     _cmem("conf entry")
+
+    feats_cpu = _stage_confidence_feats(feats, conf, dap_rank)
+    torch.cuda.empty_cache()
+    _cmem(
+        f"confidence feats staged (rank0_cpu_keys={len(feats_cpu)}, "
+        f"remaining_keys={len(feats)})"
+    )
+
+    def _rank0_feat(name: str, dtype: Optional[torch.dtype] = None) -> Tensor:
+        tensor = feats[name]
+        if dtype is None:
+            return tensor.to(device=local_device, non_blocking=True)
+        return tensor.to(device=local_device, dtype=dtype, non_blocking=True)
 
     # ══════════════════════════════════════════════════════════════════
     # Phase 0: Scatter z + broadcast small data to all GPUs
@@ -286,17 +398,17 @@ def run_confidence_dap(
         D_z = z.shape[3]
         D_s = s.shape[2]
         shape_tensor = torch.tensor(
-            [B, N, D_z, D_s], dtype=torch.long, device="cuda:0"
+            [B, N, D_z, D_s], dtype=torch.long, device=local_device
         )
     else:
-        shape_tensor = torch.zeros(4, dtype=torch.long, device=f'cuda:{dap_rank}')
+        shape_tensor = torch.zeros(4, dtype=torch.long, device=local_device)
 
     torch.distributed.broadcast(shape_tensor, src=0)
     # On rank 1: compare GPU .tolist() vs .cpu().tolist() before using (to pinpoint .tolist() vs broadcast/sync cause)
-    if dap_rank == 1:
+    if _conf_diag and dap_rank == 1:
         _gpu_list = shape_tensor.tolist()
     raw_list = shape_tensor.cpu().tolist()
-    if dap_rank == 1:
+    if _conf_diag and dap_rank == 1:
         if _gpu_list != raw_list:
             print(
                 f"    [CONF SHAPE diag] rank=1 call_idx={_DEBUG_CONF_CALL_IDX[0]} GPU_tolist={_gpu_list} CPU_tolist={raw_list} MISMATCH",
@@ -311,7 +423,7 @@ def run_confidence_dap(
             "Check that z_holder is correct on rank 0 and that sequential calls pass z per sample."
         )
     # Diagnostic: compare Rank 0 vs Rank 1 shape after broadcast (to pinpoint .tolist() vs buffer/sync cause)
-    if dap_rank in (0, 1):
+    if _conf_diag and dap_rank in (0, 1):
         _diag_call = _DEBUG_CONF_CALL_IDX[0]
         print(
             f"    [CONF SHAPE diag] rank={dap_rank} call_idx={_diag_call} raw_list={raw_list} -> B={B} N={N} D_z={D_z} D_s={D_s}",
@@ -359,20 +471,18 @@ def run_confidence_dap(
         torch.cuda.empty_cache()
         _cmem("after z scatter (full z freed)")
     else:
-        device = torch.device(f'cuda:{dap_rank}')
-        z_chunk = torch.empty(B, chunk_N, N, D_z, dtype=torch.bfloat16, device=device)
+        z_chunk = torch.empty(B, chunk_N, N, D_z, dtype=torch.bfloat16, device=local_device)
         torch.distributed.recv(z_chunk, src=0)
         z_chunk = z_chunk.float()
         torch.cuda.empty_cache()  # Release stale trunk-era reserved memory
 
     # Broadcast small 1D data: s, s_inputs, mask
     if dap_rank != 0:
-        device = torch.device(f'cuda:{dap_rank}')
-        s = torch.empty(B, N, D_s, dtype=torch.float32, device=device)
-        s_inputs = torch.empty(B, N, D_s, dtype=torch.float32, device=device)
-        mask = torch.empty(B, N, dtype=torch.float32, device=device)
+        s = torch.empty(B, N, D_s, dtype=torch.float32, device=local_device)
+        s_inputs = torch.empty(B, N, D_s, dtype=torch.float32, device=local_device)
+        mask = torch.empty(B, N, dtype=torch.float32, device=local_device)
     else:
-        mask = feats["token_pad_mask"].float()
+        mask = _rank0_feat("token_pad_mask", torch.float32)
     torch.distributed.broadcast(s, src=0)
     torch.distributed.broadcast(s_inputs, src=0)
     torch.distributed.broadcast(mask, src=0)
@@ -380,14 +490,14 @@ def run_confidence_dap(
     # Scatter N² feats entries needed for pre-PF ops
     # Helper: scatter rows of a [B,N,N,...] tensor
     def _scatter_rows(full_tensor_or_none, name, dtype=torch.float32):
-        """Scatter rows of an N² tensor: GPU 0 sends chunk rows to each GPU."""
+        """Scatter rows of an N² tensor, staging rank-0 chunks to GPU only as needed."""
         if dap_rank == 0:
             full = full_tensor_or_none
             # Broadcast ndim and last dim so other ranks can allocate
             info = torch.tensor([full.dim(), full.shape[-1] if full.dim() == 4 else 0],
-                                device=full.device, dtype=torch.long)
+                                device=local_device, dtype=torch.long)
         else:
-            info = torch.zeros(2, dtype=torch.long, device=f'cuda:{dap_rank}')
+            info = torch.zeros(2, dtype=torch.long, device=local_device)
         torch.distributed.broadcast(info, src=0)
         ndim, last_d = info.tolist()
 
@@ -400,15 +510,21 @@ def run_confidence_dap(
             for r in range(1, dap_size):
                 rs = r * chunk_N
                 re = rs + chunk_N
-                torch.distributed.send(full[:, rs:re].contiguous().to(dtype), dst=r)
-            chunk = full[:, row_start:row_end].contiguous().to(dtype)
+                chunk = full[:, rs:re].contiguous()
+                chunk_send = chunk.to(device=local_device, dtype=dtype, non_blocking=True)
+                torch.distributed.send(chunk_send, dst=r)
+                del chunk, chunk_send
+            chunk = full[:, row_start:row_end].contiguous().to(
+                device=local_device, dtype=dtype, non_blocking=True
+            )
             del full
+            torch.cuda.empty_cache()
             return chunk
         else:
             if ndim == 4:
-                chunk = torch.empty(B, chunk_N, N, int(last_d), dtype=dtype, device=f'cuda:{dap_rank}')
+                chunk = torch.empty(B, chunk_N, N, int(last_d), dtype=dtype, device=local_device)
             else:
-                chunk = torch.empty(B, chunk_N, N, dtype=dtype, device=f'cuda:{dap_rank}')
+                chunk = torch.empty(B, chunk_N, N, dtype=dtype, device=local_device)
             torch.distributed.recv(chunk, src=0)
             return chunk
 
@@ -418,48 +534,56 @@ def run_confidence_dap(
         # rel_pos needs 1D feats (full, for both row & col indexing)
         for key in ["asym_id", "residue_index", "entity_id", "sym_id", "token_index"]:
             if dap_rank == 0:
-                t = feats[key].float()
+                t = _rank0_feat(key, torch.float32)
             else:
-                t = torch.empty(B, N, dtype=torch.float32, device=f'cuda:{dap_rank}')
+                t = torch.empty(B, N, dtype=torch.float32, device=local_device)
             torch.distributed.broadcast(t, src=0)
             feats_chunk[key] = t
 
         if hasattr(conf, 'rel_pos') and hasattr(conf.rel_pos, 'cyclic_pos_enc') and conf.rel_pos.cyclic_pos_enc:
             if dap_rank == 0:
-                t = feats["cyclic_period"].float()
+                t = _rank0_feat("cyclic_period", torch.float32)
             else:
-                t = torch.empty(B, N, dtype=torch.float32, device=f'cuda:{dap_rank}')
+                t = torch.empty(B, N, dtype=torch.float32, device=local_device)
             torch.distributed.broadcast(t, src=0)
             feats_chunk["cyclic_period"] = t
 
         # token_bonds [B,N,N] or [B,N,N,1] → scatter rows
         feats_chunk["token_bonds"] = _scatter_rows(
-            feats["token_bonds"].float() if dap_rank == 0 else None, "token_bonds")
+            feats["token_bonds"] if dap_rank == 0 else None, "token_bonds")
 
         # type_bonds [B,N,N] → scatter rows (if needed)
         if conf.bond_type_feature:
             feats_chunk["type_bonds"] = _scatter_rows(
-                feats["type_bonds"].float() if dap_rank == 0 else None, "type_bonds")
+                feats["type_bonds"] if dap_rank == 0 else None, "type_bonds")
 
         # contact_conditioning [B,N,N,C] → scatter rows
         feats_chunk["contact_conditioning"] = _scatter_rows(
-            feats["contact_conditioning"].float() if dap_rank == 0 else None, "contact_conditioning")
+            feats["contact_conditioning"] if dap_rank == 0 else None, "contact_conditioning")
 
         # contact_threshold [B,N,N] → scatter rows
         feats_chunk["contact_threshold"] = _scatter_rows(
-            feats["contact_threshold"].float() if dap_rank == 0 else None, "contact_threshold")
+            feats["contact_threshold"] if dap_rank == 0 else None, "contact_threshold")
 
     # Broadcast x_pred_repr for distance bins (small: [B, N, 3])
     if dap_rank == 0:
-        token_to_rep_atom = feats["token_to_rep_atom"]
-        token_to_rep_atom = token_to_rep_atom.repeat_interleave(multiplicity, 0)
+        rep_atom_idx = feats["token_to_rep_atom"].argmax(dim=-1).to(
+            device=local_device, dtype=torch.long, non_blocking=True
+        )
+        rep_atom_idx = rep_atom_idx.repeat_interleave(multiplicity, 0)
         if len(x_pred.shape) == 4:
             Bx, mult, N_atoms, _ = x_pred.shape
             x_pred = x_pred.reshape(Bx * mult, N_atoms, -1)
-        x_pred_repr = torch.bmm(token_to_rep_atom.float(), x_pred)
+        x_pred = x_pred.to(device=local_device, non_blocking=True)
+        x_pred_repr = torch.gather(
+            x_pred,
+            1,
+            rep_atom_idx.unsqueeze(-1).expand(-1, -1, x_pred.shape[-1]),
+        )
+        del rep_atom_idx
         # x_pred_repr is [B, N, 3] — small
     else:
-        x_pred_repr = torch.empty(B, N, 3, dtype=torch.float32, device=f'cuda:{dap_rank}')
+        x_pred_repr = torch.empty(B, N, 3, dtype=torch.float32, device=local_device)
     torch.distributed.broadcast(x_pred_repr, src=0)
 
     if dap_rank == 0:
@@ -634,20 +758,11 @@ def run_confidence_dap(
     else:
         mask_padded = mask
     pair_mask_chunk = mask_padded[:, row_start:row_end].unsqueeze(-1) * mask.unsqueeze(1)
+    del feats_chunk, mask_padded
 
     _cmem("pre-PF done, PF start")
 
-    # ── Offload feats to CPU on rank 0 before PF ──
-    # Phase 1 broadcasts are done; feats only needed post-PF for Phase 3.
-    # R0 has 43GB alloc + 59.5GB reserved → only 18.8GB free.
-    # Offloading feats (~10GB) + empty_cache (reclaims 16.5GB reserved gap)
-    # gives R0 ~45GB free — enough for tri-mul's 21.7GB transient.
-    feats_cpu = {}
-    if dap_rank == 0:
-        for key in list(feats.keys()):
-            if isinstance(feats[key], torch.Tensor) and feats[key].is_cuda:
-                feats_cpu[key] = feats[key].cpu()
-                feats[key] = feats_cpu[key]  # replace with CPU ref
+    # Phase 1 broadcasts are done; rank 0 features stay on CPU until Phase 3 heads.
     # Release reserved-but-unused CUDA blocks on ALL ranks
     torch.cuda.empty_cache()
     _cmem("feats offloaded + cache cleared")
@@ -679,34 +794,243 @@ def run_confidence_dap(
 
     _cmem("PF done")
 
-    # ── Reload feats to GPU on rank 0 for Phase 3 heads ──
-    if dap_rank == 0 and feats_cpu:
-        for key in feats_cpu:
-            feats[key] = feats_cpu[key].cuda()
-        del feats_cpu
+    # Phase 3 only needs a small subset of features; keep dense setup tensors on CPU.
+    if dap_rank == 0:
         torch.cuda.empty_cache()
-        _cmem("feats reloaded to GPU")
+        _cmem("post-PF cache cleared, feats remain CPU-backed")
+
+    phase3_feats: dict[str, Tensor] = {}
+
+    def _phase3_source(name: str):
+        if name in feats_cpu:
+            return feats_cpu[name]
+        return feats[name]
+
+    def _phase3_feat(name: str, dtype: Optional[torch.dtype] = None) -> Tensor:
+        tensor = phase3_feats.get(name)
+        if tensor is None:
+            source = _phase3_source(name)
+            tensor = source.to(device=local_device, non_blocking=True)
+            phase3_feats[name] = tensor
+        if dtype is not None and tensor.dtype != dtype:
+            return tensor.to(dtype=dtype)
+        return tensor
+
+    def _phase3_feat_dict(names: list[str]) -> dict:
+        staged = {}
+        for name in names:
+            if name not in feats_cpu and name not in feats:
+                continue
+            value = _phase3_source(name)
+            staged[name] = _phase3_feat(name) if isinstance(value, torch.Tensor) else value
+        return staged
 
     # ══════════════════════════════════════════════════════════════════
-    # Phase 3: Distributed confidence heads — PAE on chunks, PDE on gathered z
+    # Phase 3: Distributed confidence heads — stream PAE, chunk PDE
     # ══════════════════════════════════════════════════════════════════
 
     heads = conf.confidence_heads
+    B_conf = z_chunk.shape[0]
+    row_valid = max(0, min(chunk_N, N - row_start))
 
-    # 3a. Compute PAE logits on z_chunk BEFORE gathering z (saves ~592 MB)
-    if heads.use_separate_heads:
-        pae_intra_chunk = heads.to_pae_intra_logits(z_chunk)  # [B, N/dap, N, bins]
-        pae_inter_chunk = heads.to_pae_inter_logits(z_chunk)
-        # We'll apply intra/inter masks after gather (need full asym_id)
-        pae_intra_logits = gather(pae_intra_chunk.contiguous(), dim=1, original_size=N)
-        pae_inter_logits = gather(pae_inter_chunk.contiguous(), dim=1, original_size=N)
-        del pae_intra_chunk, pae_inter_chunk
+    def _broadcast_token_feat(name: str, dtype: torch.dtype) -> Tensor:
+        if dap_rank == 0:
+            tensor = _phase3_feat(name, dtype=dtype)
+        else:
+            tensor = torch.empty(B, N, dtype=dtype, device=local_device)
+        torch.distributed.broadcast(tensor, src=0)
+        return tensor
+
+    from boltz.data import const
+    from boltz.model.layers.confidence_utils import (
+        compute_collinear_mask,
+        tm_function,
+    )
+
+    asym_id_token = _broadcast_token_feat("asym_id", torch.long)
+    token_pad_mask_base = _broadcast_token_feat("token_pad_mask", torch.float32)
+    token_type_base = _broadcast_token_feat("mol_type", torch.long)
+    asym_id_rep = asym_id_token.repeat_interleave(multiplicity, 0)
+    token_pad_mask_m = token_pad_mask_base.repeat_interleave(multiplicity, 0).float()
+    token_type = token_type_base.repeat_interleave(multiplicity, 0)
+    is_ligand_token = (token_type == const.chain_type_ids["NONPOLYMER"]).float()
+    is_protein_token = (token_type == const.chain_type_ids["PROTEIN"]).float()
+
+    def _phase3_atom_token_index() -> Tensor:
+        source = _phase3_source("atom_to_token")
+        return source.argmax(dim=-1).to(device=local_device, dtype=torch.long, non_blocking=True)
+
+    def _compute_frame_mask_sparse() -> Tensor:
+        frames_idx_true = _phase3_feat("frames_idx").long()
+        atom_pad_mask_base = _phase3_feat("atom_pad_mask", torch.float32)
+        atom_token_idx = _phase3_atom_token_index().clamp_(0, N - 1)
+        asym_id_atom = torch.gather(asym_id_token, 1, atom_token_idx)
+
+        B_atom, _, _ = x_pred.shape
+        pred_atom_coords = x_pred.reshape(B_atom // multiplicity, multiplicity, -1, 3)
+        frames_idx_pred = (
+            frames_idx_true.clone()
+            .repeat_interleave(multiplicity, 0)
+            .reshape(B_atom // multiplicity, multiplicity, -1, 3)
+        )
+
+        for batch_idx, pred_atom_coord in enumerate(pred_atom_coords):
+            token_idx = 0
+            atom_idx = 0
+            for chain_id in torch.unique(asym_id_token[batch_idx]):
+                mask_chain_token = (asym_id_token[batch_idx] == chain_id) * token_pad_mask_base[batch_idx]
+                mask_chain_atom = (asym_id_atom[batch_idx] == chain_id) * atom_pad_mask_base[batch_idx]
+                num_tokens = int(mask_chain_token.sum().item())
+                num_atoms = int(mask_chain_atom.sum().item())
+                if (
+                    token_type_base[batch_idx, token_idx] != const.chain_type_ids["NONPOLYMER"]
+                    or num_atoms < 3
+                ):
+                    token_idx += num_tokens
+                    atom_idx += num_atoms
+                    continue
+                chain_atom_mask = mask_chain_atom.bool()
+                chain_coords = pred_atom_coord[:, chain_atom_mask]
+                dist_mat = ((chain_coords[:, None, :, :] - chain_coords[:, :, None, :]) ** 2).sum(-1) ** 0.5
+                resolved_pair = 1 - (
+                    atom_pad_mask_base[batch_idx][chain_atom_mask][None, :]
+                    * atom_pad_mask_base[batch_idx][chain_atom_mask][:, None]
+                ).to(torch.float32)
+                resolved_pair[resolved_pair == 1] = torch.inf
+                indices = torch.sort(dist_mat + resolved_pair, axis=2).indices
+                frames = torch.cat(
+                    [indices[:, :, 1:2], indices[:, :, 0:1], indices[:, :, 2:3]], dim=2
+                ) + atom_idx
+                try:
+                    frames_idx_pred[batch_idx, :, token_idx : token_idx + num_atoms, :] = frames
+                except Exception as exc:
+                    print(f"Failed to process {feats.get('pdb_id', '<unknown>')} due to {exc}")
+                token_idx += num_tokens
+                atom_idx += num_atoms
+
+        device = frames_idx_pred.device
+        frames_expanded = pred_atom_coords[
+            torch.arange(0, B_atom // multiplicity, 1, device=device)[:, None, None, None],
+            torch.arange(0, multiplicity, 1, device=device)[None, :, None, None],
+            frames_idx_pred,
+        ].reshape(-1, 3, 3)
+        mask_collinear_pred = compute_collinear_mask(
+            frames_expanded[:, 1] - frames_expanded[:, 0],
+            frames_expanded[:, 1] - frames_expanded[:, 2],
+        ).reshape(B_atom // multiplicity, multiplicity, -1)
+        return (mask_collinear_pred * token_pad_mask_base[:, None, :]).reshape(-1, N).float()
+
+    if dap_rank == 0:
+        try:
+            maski = _compute_frame_mask_sparse()
+        except Exception as exc:
+            print(f"Error in streamed PAE/PTM frame mask: {exc}")
+            maski = torch.zeros(B_conf, N, dtype=torch.float32, device=local_device)
     else:
-        pae_chunk = heads.to_pae_logits(z_chunk)  # [B, N/dap, N, 64]
-        pae_logits = gather(pae_chunk.contiguous(), dim=1, original_size=N)  # [B, N, N, 64]
-        del pae_chunk
+        maski = torch.empty(B_conf, N, dtype=torch.float32, device=local_device)
+    torch.distributed.broadcast(maski, src=0)
 
-    _cmem("PAE computed + gathered")
+    z_pae = z_chunk[:, :row_valid, :, :]
+    if heads.use_separate_heads:
+        row_asym = asym_id_rep[:, row_start : row_start + row_valid]
+        same_chain_chunk = row_asym.unsqueeze(-1) == asym_id_rep.unsqueeze(1)
+        pae_logits_chunk = heads.to_pae_intra_logits(z_pae)
+        m_same = same_chain_chunk.to(dtype=pae_logits_chunk.dtype).unsqueeze(-1)
+        pae_logits_chunk.mul_(m_same)
+        pae_inter_chunk = heads.to_pae_inter_logits(z_pae)
+        pae_logits_chunk.addcmul_(pae_inter_chunk, 1.0 - m_same)
+        del pae_inter_chunk, m_same, same_chain_chunk, row_asym
+    else:
+        pae_logits_chunk = heads.to_pae_logits(z_pae)
+    del z_pae
+
+    num_pae_bins = pae_logits_chunk.shape[-1]
+    pae_bin_width = 32.0 / num_pae_bins
+    pae_bounds = torch.arange(
+        start=0.5 * pae_bin_width,
+        end=32.0,
+        step=pae_bin_width,
+        device=local_device,
+        dtype=torch.float32,
+    )
+    pae_probs = torch.nn.functional.softmax(pae_logits_chunk, dim=-1)
+    del pae_logits_chunk
+    pae_chunk_value = torch.sum(
+        pae_probs * pae_bounds.view(*((1,) * (pae_probs.ndim - 1)), num_pae_bins),
+        dim=-1,
+    ).float()
+
+    pae_full_cpu: Optional[Tensor] = None
+    if write_full_pae:
+        _pae_stream_pin = bool(torch.cuda.is_available())
+        if dap_rank == 0:
+            pae_full_cpu = torch.empty((B_conf, N, N), dtype=torch.float32, device="cpu", pin_memory=_pae_stream_pin)
+            if row_valid > 0:
+                pae_full_cpu[:, row_start : row_start + row_valid].copy_(
+                    pae_chunk_value.cpu(), non_blocking=_pae_stream_pin
+                )
+            for src_rank in range(1, dap_size):
+                src_start = src_rank * chunk_N
+                src_valid = max(0, min(chunk_N, N - src_start))
+                if src_valid <= 0:
+                    continue
+                recv_buf = torch.empty(B_conf, src_valid, N, dtype=torch.float32, device=local_device)
+                torch.distributed.recv(recv_buf, src=src_rank)
+                pae_full_cpu[:, src_start : src_start + src_valid].copy_(
+                    recv_buf.cpu(), non_blocking=_pae_stream_pin
+                )
+                del recv_buf
+        elif row_valid > 0:
+            torch.distributed.send(pae_chunk_value.contiguous(), dst=0)
+
+    N_res = token_pad_mask_m.sum(dim=-1, keepdim=True)
+    tm_values = tm_function(pae_bounds.unsqueeze(0), N_res).view(B_conf, 1, 1, num_pae_bins)
+    tm_expected_chunk = torch.sum(pae_probs.float() * tm_values, dim=-1)
+    del pae_probs, tm_values
+
+    row_slice = slice(row_start, row_start + row_valid)
+    maski_rows = maski[:, row_slice]
+    token_pad_rows = token_pad_mask_m[:, row_slice]
+    asym_rows = asym_id_rep[:, row_slice]
+    ligand_rows = is_ligand_token[:, row_slice]
+    protein_rows = is_protein_token[:, row_slice]
+
+    def _chunk_max_score(pair_mask: Tensor) -> Tensor:
+        numer = (tm_expected_chunk * pair_mask).sum(dim=-1)
+        denom = pair_mask.sum(dim=-1)
+        score = numer / (denom + 1e-5)
+        local_max = score.max(dim=1).values if score.shape[1] > 0 else torch.zeros(B_conf, device=local_device)
+        torch.distributed.all_reduce(local_max, op=torch.distributed.ReduceOp.MAX)
+        return local_max
+
+    pair_mask_ptm = maski_rows[:, :, None] * token_pad_mask_m[:, None, :] * token_pad_rows[:, :, None]
+    ptm = _chunk_max_score(pair_mask_ptm)
+    pair_mask_iptm = pair_mask_ptm * (asym_id_rep[:, None, :] != asym_rows[:, :, None])
+    iptm = _chunk_max_score(pair_mask_iptm)
+    ligand_iptm_mask = pair_mask_iptm * (
+        (ligand_rows[:, :, None] * is_protein_token[:, None, :])
+        + (protein_rows[:, :, None] * is_ligand_token[:, None, :])
+    )
+    ligand_iptm = _chunk_max_score(ligand_iptm_mask)
+    protein_iptm_mask = pair_mask_iptm * (protein_rows[:, :, None] * is_protein_token[:, None, :])
+    protein_iptm = _chunk_max_score(protein_iptm_mask)
+
+    pair_chains_iptm = {}
+    asym_ids_list = [int(idx) for idx in torch.unique(asym_id_rep).tolist()]
+    for idx1 in asym_ids_list:
+        chain_iptm = {}
+        for idx2 in asym_ids_list:
+            mask_pair_chain = pair_mask_ptm * (
+                (asym_id_rep[:, None, :] == idx1) * (asym_rows[:, :, None] == idx2)
+            )
+            chain_iptm[idx2] = _chunk_max_score(mask_pair_chain)
+            del mask_pair_chain
+        pair_chains_iptm[idx1] = chain_iptm
+    del pair_mask_ptm, pair_mask_iptm, ligand_iptm_mask, protein_iptm_mask
+    del tm_expected_chunk, pae_chunk_value, maski, maski_rows, token_pad_rows
+    del ligand_rows, protein_rows
+    torch.cuda.empty_cache()
+    _cmem("streamed PAE summaries done")
 
     # Gather d_chunk → full d (collective, small)
     d_full = gather(d_chunk.contiguous(), dim=1, original_size=N)
@@ -718,7 +1042,6 @@ def run_confidence_dap(
     keep_pde_logits = os.environ.get("BOLTZ_DAP_KEEP_PDE_LOGITS", "0") == "1"
     D_z_chunk = z_chunk.shape[3]
     if dap_rank == 0 and heads.use_separate_heads:
-        asym_id_token = feats["asym_id"]
         is_same_chain = (asym_id_token.unsqueeze(-1) == asym_id_token.unsqueeze(-2)).float()
         is_different_chain = 1.0 - is_same_chain
 
@@ -731,15 +1054,12 @@ def run_confidence_dap(
     if dap_rank == 0:
         from boltz.model.layers.confidence_utils import compute_aggregated_metric as _pde_expectation
 
-        pred_distogram_prob = torch.nn.functional.softmax(
-            pred_distogram_logits, dim=-1
+        prob_contact = _stream_contact_probability(
+            pred_distogram_logits,
+            local_device,
+            int(os.environ.get("BOLTZ_CONF_DISTOGRAM_ROW_CHUNK", "16")),
         ).repeat_interleave(multiplicity, 0)
-        contacts = torch.zeros(
-            (1, 1, 1, 64), dtype=pred_distogram_prob.dtype, device=pred_distogram_prob.device
-        )
-        contacts[:, :, :, :20] = 1.0
-        prob_contact = (pred_distogram_prob * contacts).sum(-1)
-        token_pad_mask_m = feats["token_pad_mask"].repeat_interleave(multiplicity, 0)
+        token_pad_mask_m = token_pad_mask_base.repeat_interleave(multiplicity, 0)
         token_pad_pair_mask = (
             token_pad_mask_m.unsqueeze(-1)
             * token_pad_mask_m.unsqueeze(-2)
@@ -751,16 +1071,17 @@ def run_confidence_dap(
             )
         )
         token_pair_mask = token_pad_pair_mask * prob_contact
-        asym_id_rep = feats["asym_id"].repeat_interleave(multiplicity, 0)
+        asym_id_rep = asym_id_token.repeat_interleave(multiplicity, 0)
         token_interface_pair_mask = token_pair_mask * (
             asym_id_rep.unsqueeze(-1) != asym_id_rep.unsqueeze(-2)
         )
-        numer_pde = torch.zeros(B, device=pred_distogram_logits.device, dtype=torch.float32)
-        denom_pde = torch.zeros(B, device=pred_distogram_logits.device, dtype=torch.float32)
-        numer_ipde = torch.zeros(B, device=pred_distogram_logits.device, dtype=torch.float32)
-        denom_ipde = torch.zeros(B, device=pred_distogram_logits.device, dtype=torch.float32)
+        numer_pde = torch.zeros(B, device=local_device, dtype=torch.float32)
+        denom_pde = torch.zeros(B, device=local_device, dtype=torch.float32)
+        numer_ipde = torch.zeros(B, device=local_device, dtype=torch.float32)
+        denom_ipde = torch.zeros(B, device=local_device, dtype=torch.float32)
         _pde_stream_pin = bool(torch.cuda.is_available())
-        pde_full_cpu = torch.empty((B, N, N), dtype=torch.float32, device="cpu", pin_memory=_pde_stream_pin)
+        if write_full_pde:
+            pde_full_cpu = torch.empty((B_conf, N, N), dtype=torch.float32, device="cpu", pin_memory=_pde_stream_pin)
         pde_logits_cpu_chunks = [] if keep_pde_logits else None
 
     for r_idx in range(dap_size):
@@ -794,7 +1115,7 @@ def run_confidence_dap(
                 if k == 0:
                     z_col_parts.append(z_chunk[:, :, r_start:r_end_col, :].clone())
                 else:
-                    buf = torch.empty(B, row_k, col_chunk_size, D_z_chunk, dtype=z_chunk.dtype, device="cuda:0")
+                    buf = torch.empty(B, row_k, col_chunk_size, D_z_chunk, dtype=z_chunk.dtype, device=local_device)
                     torch.distributed.recv(buf, src=k)
                     z_col_parts.append(buf)
             z_col = torch.cat(z_col_parts, dim=1)
@@ -832,7 +1153,8 @@ def run_confidence_dap(
             denom_pde += m_blk.sum(dim=(1, 2))
             numer_ipde += (pde_ij * iface_blk).sum(dim=(1, 2))
             denom_ipde += iface_blk.sum(dim=(1, 2))
-            pde_full_cpu[:, :, r_start:r_end_col].copy_(pde_ij.cpu(), non_blocking=_pde_stream_pin)
+            if pde_full_cpu is not None:
+                pde_full_cpu[:, :, r_start:r_end_col].copy_(pde_ij.cpu(), non_blocking=_pde_stream_pin)
             if pde_logits_cpu_chunks is not None:
                 pde_logits_cpu_chunks.append(pde_c.detach().cpu())
             del pde_c, pde_cm, pde_ij, m_blk, iface_blk
@@ -851,8 +1173,8 @@ def run_confidence_dap(
             del pde_logits_cpu_chunks
             if N_padded != N:
                 pde_logits = pde_logits[:, :N, :N, :].contiguous()
-        # Masks / distogram prob only used inside chunked PDE; drop before 3c to free GB-scale GPU.
-        del pred_distogram_prob, prob_contact, token_pad_pair_mask, contacts
+        # Masks / contact probabilities are only used inside chunked PDE.
+        del prob_contact, token_pad_pair_mask
         del token_pair_mask, token_interface_pair_mask, asym_id_rep
     _barrier()
     _cmem("chunked PDE done")
@@ -866,18 +1188,6 @@ def run_confidence_dap(
             out_dict["s_conf"] = s
             out_dict["z_conf"] = None  # not kept to save memory
 
-        # Apply intra/inter masks for separate heads PAE (in-place: avoid intra+inter+out triple peak)
-        if heads.use_separate_heads:
-            asym_id_token = feats["asym_id"]
-            is_same_chain = asym_id_token.unsqueeze(-1) == asym_id_token.unsqueeze(-2)
-            is_different_chain = ~is_same_chain
-            m_same = is_same_chain.float().unsqueeze(-1)
-            m_diff = is_different_chain.float().unsqueeze(-1)
-            pae_intra_logits.mul_(m_same)
-            pae_intra_logits.addcmul_(pae_inter_logits, m_diff)
-            del pae_inter_logits
-            pae_logits = pae_intra_logits
-
         _cmem("PDE done")
 
         # s-only heads
@@ -888,25 +1198,20 @@ def run_confidence_dap(
         from boltz.data import const
         from boltz.model.layers.confidence_utils import (
             compute_aggregated_metric,
-            compute_ptms,
         )
 
         ligand_weight = 20
         non_interface_weight = 1
         interface_weight = 10
 
-        token_type = feats["mol_type"]
-        token_type = token_type.repeat_interleave(multiplicity, 0)
-        is_ligand_token = (token_type == const.chain_type_ids["NONPOLYMER"]).float()
-
         if heads.token_level_confidence:
             plddt = compute_aggregated_metric(plddt_logits)
-            token_pad_mask = feats["token_pad_mask"].repeat_interleave(multiplicity, 0)
+            token_pad_mask = token_pad_mask_base.repeat_interleave(multiplicity, 0)
             complex_plddt = (plddt * token_pad_mask).sum(dim=-1) / token_pad_mask.sum(dim=-1)
 
             is_contact = (d_full < 8).float()
             is_different_chain_metric = (
-                feats["asym_id"].unsqueeze(-1) != feats["asym_id"].unsqueeze(-2)
+                asym_id_token.unsqueeze(-1) != asym_id_token.unsqueeze(-2)
             ).float()
             is_different_chain_metric = is_different_chain_metric.repeat_interleave(multiplicity, 0)
             token_interface_mask = torch.max(
@@ -927,18 +1232,20 @@ def run_confidence_dap(
             B_h, N_h, _ = resolved_logits.shape
             resolved_logits = resolved_logits.reshape(B_h, N_h, heads.max_num_atoms_per_token, 2)
             arange_max = torch.arange(heads.max_num_atoms_per_token).reshape(1, 1, -1).to(resolved_logits.device)
-            max_atoms_mask = feats["atom_to_token"].sum(1).unsqueeze(-1) > arange_max
+            atom_to_token_base = _phase3_feat("atom_to_token")
+            atom_pad_mask_base = _phase3_feat("atom_pad_mask")
+            max_atoms_mask = atom_to_token_base.sum(1).unsqueeze(-1) > arange_max
             resolved_logits = resolved_logits[:, max_atoms_mask.squeeze(0)]
-            resolved_logits = nn_pad(resolved_logits, (0, 0, 0, int(feats["atom_pad_mask"].shape[1] - feats["atom_pad_mask"].sum().item())), value=0)
+            resolved_logits = nn_pad(resolved_logits, (0, 0, 0, int(atom_pad_mask_base.shape[1] - atom_pad_mask_base.sum().item())), value=0)
             plddt_logits = plddt_logits.reshape(B_h, N_h, heads.max_num_atoms_per_token, -1)
             plddt_logits = plddt_logits[:, max_atoms_mask.squeeze(0)]
-            plddt_logits = nn_pad(plddt_logits, (0, 0, 0, int(feats["atom_pad_mask"].shape[1] - feats["atom_pad_mask"].sum().item())), value=0)
-            atom_pad_mask = feats["atom_pad_mask"].repeat_interleave(multiplicity, 0)
+            plddt_logits = nn_pad(plddt_logits, (0, 0, 0, int(atom_pad_mask_base.shape[1] - atom_pad_mask_base.sum().item())), value=0)
+            atom_pad_mask = atom_pad_mask_base.repeat_interleave(multiplicity, 0)
             plddt = compute_aggregated_metric(plddt_logits)
             complex_plddt = (plddt * atom_pad_mask).sum(dim=-1) / atom_pad_mask.sum(dim=-1)
-            token_type_f = feats["mol_type"].float()
-            atom_to_token = feats["atom_to_token"].float()
-            chain_id_token = feats["asym_id"].float()
+            token_type_f = token_type_base.float()
+            atom_to_token = atom_to_token_base.float()
+            chain_id_token = asym_id_token.float()
             atom_type = torch.bmm(atom_to_token, token_type_f.unsqueeze(-1)).squeeze(-1)
             is_ligand_atom = (atom_type == const.chain_type_ids["NONPOLYMER"]).float()
             d_atom = torch.cdist(x_pred, x_pred)
@@ -954,8 +1261,8 @@ def run_confidence_dap(
                 + atom_interface_mask * interface_weight
                 + atom_non_interface_mask * non_interface_weight
             )
-            complex_iplddt = (plddt * feats["atom_pad_mask"] * iplddt_weight).sum(dim=-1) / torch.sum(
-                feats["atom_pad_mask"] * iplddt_weight, dim=-1
+            complex_iplddt = (plddt * atom_pad_mask_base * iplddt_weight).sum(dim=-1) / torch.sum(
+                atom_pad_mask_base * iplddt_weight, dim=-1
             )
 
         # gPDE / giPDE / pde field: already computed during chunked PDE (same formulas as confidencev2).
@@ -970,26 +1277,14 @@ def run_confidence_dap(
             complex_iplddt=complex_iplddt,
             complex_pde=complex_pde,
             complex_ipde=complex_ipde,
+            ptm=ptm,
+            iptm=iptm,
+            ligand_iptm=ligand_iptm,
+            protein_iptm=protein_iptm,
+            pair_chains_iptm=pair_chains_iptm,
         ))
-        out_dict["pae_logits"] = pae_logits
-        out_dict["pae"] = compute_aggregated_metric(pae_logits, end=32)
-
-        try:
-            ptm, iptm, ligand_iptm, protein_iptm, pair_chains_iptm = compute_ptms(
-                pae_logits, x_pred, feats, multiplicity
-            )
-            out_dict["ptm"] = ptm
-            out_dict["iptm"] = iptm
-            out_dict["ligand_iptm"] = ligand_iptm
-            out_dict["protein_iptm"] = protein_iptm
-            out_dict["pair_chains_iptm"] = pair_chains_iptm
-        except Exception as e:
-            print(f"Error in compute_ptms: {e}")
-            out_dict["ptm"] = torch.zeros_like(complex_plddt)
-            out_dict["iptm"] = torch.zeros_like(complex_plddt)
-            out_dict["ligand_iptm"] = torch.zeros_like(complex_plddt)
-            out_dict["protein_iptm"] = torch.zeros_like(complex_plddt)
-            out_dict["pair_chains_iptm"] = torch.zeros_like(complex_plddt)
+        if write_full_pae:
+            out_dict["pae"] = pae_full_cpu
 
         return out_dict
     else:
