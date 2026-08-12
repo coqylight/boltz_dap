@@ -1,4 +1,4 @@
-# Boltz-DAP: Distributed Axial Parallelism for Boltz-2
+# Boltz-DAP: Dynamic Axial Parallelism for Boltz-2
 
 > Run [Boltz-2](https://github.com/jwohlwend/boltz) protein structure prediction on large complexes (>2,000 amino acid residues) across multiple GPUs without OOM.
 
